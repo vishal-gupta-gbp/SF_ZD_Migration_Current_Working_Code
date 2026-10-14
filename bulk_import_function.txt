@@ -1,0 +1,480 @@
+def _submit_bulk_ticket_import_job(
+    zd: ZendeskClient, batch_items: List[Dict[str, Any]], archive_immediately: bool = False,
+) -> Dict[str, Any]:
+    """Submit up to 100 ticket payloads and wait for Zendesk's asynchronous import job."""
+    body = {"tickets": [item["api_payload"] for item in batch_items]}
+    response = zd.request(
+        "POST",
+        "/api/v2/imports/tickets/create_many.json",
+        params={"archive_immediately": str(archive_immediately).lower()},
+        json_body=body,
+    )
+    if response.status_code not in {200, 201, 202}:
+        raise _BulkTicketRequestError(response.status_code, response.text[:5000])
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Zendesk bulk ticket import returned invalid JSON: {response.text[:2000]}") from exc
+    job = data.get("job_status", data) if isinstance(data, dict) else {}
+    if not isinstance(job, dict) or not (job.get("id") or job.get("url")):
+        raise RuntimeError(f"Zendesk bulk ticket import did not return a job status: {str(data)[:2000]}")
+
+    job_id = s(job.get("id"))
+    job_url = s(job.get("url"))
+    deadline = time.monotonic() + 1800  # wait up to 30 minutes; do not submit the same batch again on timeout
+
+    while True:
+        status = norm(job.get("status"))
+        if status in {"completed", "failed"}:
+            return job
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Zendesk bulk ticket import job {job_id or job_url} did not finish within 30 minutes. "
+                "Do not retry this batch automatically; ticket creation may still be running."
+            )
+
+        if not job_url:
+            if not job_id:
+                raise RuntimeError(f"Zendesk bulk ticket import job has no poll URL or job ID: {str(job)[:1000]}")
+            job_url = f"{zd.base_url}/api/v2/job_statuses/{job_id}.json"
+
+        time.sleep(2)
+        poll = zd.request("GET", job_url)
+        if poll.status_code != 200:
+            raise RuntimeError(
+                f"Zendesk bulk ticket import job poll failed: HTTP {poll.status_code}\n{poll.text[:3000]}"
+            )
+        try:
+            poll_data = poll.json()
+        except Exception as exc:
+            raise RuntimeError(f"Zendesk job status returned invalid JSON: {poll.text[:2000]}") from exc
+        job = poll_data.get("job_status", poll_data) if isinstance(poll_data, dict) else {}
+        if not isinstance(job, dict):
+            raise RuntimeError(f"Invalid Zendesk job status response: {str(poll_data)[:2000]}")
+        job_id = s(job.get("id")) or job_id
+        job_url = s(job.get("url")) or job_url
+
+
+class _BulkTicketRequestError(RuntimeError):
+    def __init__(self, status_code: int, response_text: str):
+        self.status_code = int(status_code)
+        super().__init__(f"Zendesk bulk ticket import failed: HTTP {status_code}\n{response_text}")
+
+
+def import_prepared_tickets_modular(
+    cfg: Dict[str, Any], script_dir: Path, archive_immediately: bool = False,
+    payload_filename: str = "tickets_payload_standard.json", result_prefix: str = "Standard_Migration_Results",
+) -> Dict[str, Any]:
+    """Import prepared tickets in Zendesk batches of up to 100, with per-ticket audit and ID verification."""
+    workspace = modular_workspace(cfg, script_dir)
+    payload_path = workspace / "payload" / payload_filename
+    if not payload_path.exists():
+        raise RuntimeError(f"{payload_filename} not found. Run 03_prepare_tickets.py first.")
+    tickets = json.loads(payload_path.read_text(encoding="utf-8")).get("tickets", [])
+    if not isinstance(tickets, list):
+        raise RuntimeError(f"Invalid ticket payload structure in {payload_filename}.")
+    if not tickets:
+        return {
+            "total": 0, "completed": 0, "existing": 0, "failed": 0,
+            "completed_with_warnings": 0, "manual_review_required": 0,
+            "result_file": str(workspace / "import" / f"{result_prefix}.xlsx"),
+        }
+
+    zd = _modular_zendesk_client(cfg)
+    akarsh = zd.find_user_by_email(AGENT_COMMENT_EMAIL)
+    if not akarsh:
+        raise RuntimeError(f"Zendesk agent not found for {AGENT_COMMENT_EMAIL}.")
+    akarsh_user_id = int(akarsh["id"])
+
+    state_path = workspace / "state" / "ticket_state.json"
+    state = load_json(state_path) if state_path.exists() else {}
+    if not isinstance(state, dict):
+        state = {}
+    attachment_rows_by_case = _runtime_attachment_rows(workspace)
+    results: List[Dict[str, Any]] = []
+    attachment_log: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+    bulk_enabled = True
+    batch_number = 0
+
+    def save_ticket_state(case_id: str, ticket_id: Optional[int], status: str, external_id: str = "", message: str = "") -> None:
+        record: Dict[str, Any] = {"status": status}
+        if ticket_id:
+            record["zendesk_id"] = int(ticket_id)
+        if external_id:
+            record["zendesk_external_id"] = external_id
+        if message:
+            record["message"] = message
+        state[case_id] = record
+        save_json(state_path, state)
+
+    def record_single_import(item: Dict[str, Any], fallback_reason: str = "") -> None:
+        """Compatibility fallback when bulk import is unavailable or a single bad payload is isolated."""
+        case_id = item["case_id"]
+        ticket_id = 0
+        attempts = 1
+        try:
+            ticket = zd.import_ticket(item["api_payload"], archive_immediately=archive_immediately)
+            ticket_id = int(ticket["id"])
+            verified = _validate_ticket_external_id(zd, ticket_id, case_id, ticket)
+            final_status = "COMPLETED_WITH_WARNINGS" if item["attachment_stats"]["attachments_failed"] else "COMPLETED"
+            save_ticket_state(case_id, ticket_id, "completed" if final_status == "COMPLETED" else "completed_with_warnings", verified)
+            results.append(_build_audit_row(
+                case_id, item["case_number"], item["source"], final_status,
+                item["started"], _utc_now_text(),
+                zendesk_ticket_id=ticket_id, salesforce_case_id_sent=case_id,
+                zendesk_external_id=verified, id_match="YES", attempts=attempts,
+                **item["attachment_stats"],
+            ))
+        except Exception as exc:
+            detail = _safe_error_detail(exc)
+            status = "MANUAL_REVIEW_REQUIRED" if ticket_id else "FAILED"
+            if ticket_id:
+                save_ticket_state(case_id, ticket_id, "manual_review_required", message=detail)
+            results.append(_build_audit_row(
+                case_id, item["case_number"], item["source"], status,
+                item["started"], _utc_now_text(),
+                zendesk_ticket_id=ticket_id, salesforce_case_id_sent=case_id,
+                id_match="NO", attempts=attempts,
+                http_status=_extract_http_status(detail), error_type=_classify_error(detail),
+                failure_reason=detail.splitlines()[0][:1000],
+                error_detail=(f"{fallback_reason}\n{detail}" if fallback_reason else detail),
+                **item["attachment_stats"],
+            ))
+
+    def record_known_creation(item: Dict[str, Any], ticket_id: int, source_result: str = "bulk result") -> None:
+        case_id = item["case_id"]
+        try:
+            # Bulk job results normally return ID/index only; explicitly read the ticket back and verify external_id.
+            verified = _validate_ticket_external_id(zd, int(ticket_id), case_id, {"id": int(ticket_id)})
+            final_status = "COMPLETED_WITH_WARNINGS" if item["attachment_stats"]["attachments_failed"] else "COMPLETED"
+            save_ticket_state(
+                case_id, int(ticket_id),
+                "completed" if final_status == "COMPLETED" else "completed_with_warnings",
+                verified,
+            )
+            results.append(_build_audit_row(
+                case_id, item["case_number"], item["source"], final_status,
+                item["started"], _utc_now_text(),
+                zendesk_ticket_id=int(ticket_id), salesforce_case_id_sent=case_id,
+                zendesk_external_id=verified, id_match="YES", attempts=1,
+                **item["attachment_stats"],
+            ))
+        except Exception as exc:
+            detail = _safe_error_detail(exc)
+            save_ticket_state(case_id, int(ticket_id), "manual_review_required", message=detail)
+            results.append(_build_audit_row(
+                case_id, item["case_number"], item["source"], "MANUAL_REVIEW_REQUIRED",
+                item["started"], _utc_now_text(),
+                zendesk_ticket_id=int(ticket_id), salesforce_case_id_sent=case_id,
+                id_match="NO", attempts=1, http_status=_extract_http_status(detail),
+                error_type=_classify_error(detail),
+                failure_reason=detail.splitlines()[0][:1000],
+                error_detail=f"{source_result}: {detail}",
+                **item["attachment_stats"],
+            ))
+
+    def record_unresolved_bulk_item(item: Dict[str, Any], job: Dict[str, Any], item_result: Optional[Dict[str, Any]]) -> None:
+        """Recover by external_id when possible; otherwise park for manual review to prevent duplicate creation."""
+        case_id = item["case_id"]
+        item_result = item_result or {}
+        explicit_error = (
+            s(item_result.get("error")) or s(item_result.get("message"))
+            or s(item_result.get("error_message"))
+        )
+        if item_result.get("success") is False and explicit_error:
+            detail = explicit_error
+            results.append(_build_audit_row(
+                case_id, item["case_number"], item["source"], "FAILED",
+                item["started"], _utc_now_text(),
+                salesforce_case_id_sent=case_id, id_match="NO", attempts=1,
+                http_status=_extract_http_status(detail), error_type=_classify_error(detail),
+                failure_reason=detail.splitlines()[0][:1000], error_detail=detail,
+                **item["attachment_stats"],
+            ))
+            return
+
+        found = zd.find_ticket_by_external_id(case_id)
+        if found and found.get("id"):
+            record_known_creation(item, int(found["id"]), "external_id recovery after bulk job")
+            return
+
+        job_id = s(job.get("id"))
+        detail = (
+            f"Bulk job {job_id or '(unknown ID)'} ended with status '{s(job.get('status'))}' "
+            f"but returned no ticket ID for batch index {item['batch_index']}. "
+            f"Job message: {s(job.get('message')) or 'No job message'}"
+        )
+        save_ticket_state(case_id, None, "manual_review_required", message=detail)
+        results.append(_build_audit_row(
+            case_id, item["case_number"], item["source"], "MANUAL_REVIEW_REQUIRED",
+            item["started"], _utc_now_text(),
+            salesforce_case_id_sent=case_id, id_match="NO", attempts=1,
+            error_type="BULK_RESULT_MISSING", failure_reason=detail[:1000],
+            error_detail=detail, **item["attachment_stats"],
+        ))
+
+    def process_batch(batch_items: List[Dict[str, Any]]) -> None:
+        nonlocal bulk_enabled, batch_number
+        if not batch_items:
+            return
+        if not bulk_enabled:
+            for item in batch_items:
+                record_single_import(item, "Bulk endpoint unavailable; used one-ticket import fallback.")
+            return
+
+        batch_number += 1
+        first_case = batch_items[0]["case_number"] or batch_items[0]["case_id"]
+        last_case = batch_items[-1]["case_number"] or batch_items[-1]["case_id"]
+        print(
+            f"[Bulk Import] Submitting batch {batch_number}: {len(batch_items)} tickets "
+            f"({first_case} -> {last_case})",
+            flush=True,
+        )
+        try:
+            job = _submit_bulk_ticket_import_job(zd, batch_items, archive_immediately)
+        except _BulkTicketRequestError as exc:
+            # A 403 means create_many is not available to this Zendesk role. Fall back automatically.
+            if exc.status_code == 403:
+                bulk_enabled = False
+                print(
+                    "WARNING: Zendesk bulk ticket import returned HTTP 403. "
+                    "Falling back to the existing one-ticket import API for this and remaining batches.",
+                    flush=True,
+                )
+                for item in batch_items:
+                    record_single_import(item, "Bulk endpoint returned HTTP 403.")
+                return
+            # If a batch is rejected before job creation, split validation/body-size failures to isolate a bad record.
+            if exc.status_code in {400, 413, 422}:
+                if len(batch_items) > 1:
+                    midpoint = len(batch_items) // 2
+                    print(
+                        f"WARNING: Bulk batch rejected with HTTP {exc.status_code}; splitting into "
+                        f"{midpoint} and {len(batch_items) - midpoint} ticket sub-batches.",
+                        flush=True,
+                    )
+                    process_batch(batch_items[:midpoint])
+                    process_batch(batch_items[midpoint:])
+                else:
+                    record_single_import(batch_items[0], str(exc))
+                return
+            # The server response did not confirm that the batch was safely rejected; stop rather than risk duplicate creation.
+            for item in batch_items:
+                detail = str(exc)
+                save_ticket_state(item["case_id"], None, "manual_review_required", message=detail)
+                results.append(_build_audit_row(
+                    item["case_id"], item["case_number"], item["source"], "MANUAL_REVIEW_REQUIRED",
+                    item["started"], _utc_now_text(),
+                    salesforce_case_id_sent=item["case_id"], id_match="NO", attempts=1,
+                    http_status=exc.status_code, error_type=_classify_error(detail),
+                    failure_reason=detail.splitlines()[0][:1000], error_detail=detail,
+                    **item["attachment_stats"],
+                ))
+            raise RuntimeError(
+                f"Stopping ticket import after bulk submission failed with HTTP {exc.status_code}. "
+                "The batch was marked for manual review to avoid accidental duplicates."
+            ) from exc
+        except Exception as exc:
+            # Network/poll errors can occur after Zendesk has accepted a job. Never resubmit these payloads automatically.
+            detail = _safe_error_detail(exc)
+            for item in batch_items:
+                save_ticket_state(item["case_id"], None, "manual_review_required", message=detail)
+                results.append(_build_audit_row(
+                    item["case_id"], item["case_number"], item["source"], "MANUAL_REVIEW_REQUIRED",
+                    item["started"], _utc_now_text(),
+                    salesforce_case_id_sent=item["case_id"], id_match="NO", attempts=1,
+                    http_status=_extract_http_status(detail), error_type=_classify_error(detail),
+                    failure_reason=detail.splitlines()[0][:1000], error_detail=detail,
+                    **item["attachment_stats"],
+                ))
+            raise RuntimeError(
+                "Stopping ticket import because the bulk job outcome could not be confirmed. "
+                "The batch was marked for manual review; do not rerun it until checking Zendesk by external_id."
+            ) from exc
+
+        job_status = norm(job.get("status"))
+        job_results = job.get("results", [])
+        by_index: Dict[int, Dict[str, Any]] = {}
+        if isinstance(job_results, list):
+            for result in job_results:
+                if not isinstance(result, dict):
+                    continue
+                try:
+                    idx = int(result.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(batch_items):
+                    by_index[idx] = result
+            # Compatibility only for responses that return ordered results without index properties.
+            if not by_index and len(job_results) == len(batch_items):
+                by_index = {i: r for i, r in enumerate(job_results) if isinstance(r, dict)}
+
+        if job_status == "failed":
+            print(
+                f"WARNING: Zendesk bulk job {s(job.get('id'))} ended as failed: "
+                f"{s(job.get('message')) or 'No job message'}. Reconciling every ticket result.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Bulk Import] Job {s(job.get('id')) or '(unknown ID)'} completed; "
+                f"results returned: {len(by_index)}/{len(batch_items)}",
+                flush=True,
+            )
+
+        for idx, item in enumerate(batch_items):
+            item["batch_index"] = idx
+            bulk_result = by_index.get(idx)
+            ticket_id = bulk_result.get("id") if isinstance(bulk_result, dict) else None
+            if ticket_id:
+                record_known_creation(item, int(ticket_id))
+            else:
+                record_unresolved_bulk_item(item, job, bulk_result)
+
+    def flush_pending() -> None:
+        if pending:
+            current = list(pending)
+            pending.clear()
+            process_batch(current)
+
+    print(
+        f"STEP import - {'BULK' if bulk_enabled else 'single-ticket'} mode; "
+        f"batch size {BATCH_SIZE} (Zendesk maximum is 100). Payload tickets: {len(tickets)}",
+        flush=True,
+    )
+
+    for ticket_index, payload in enumerate(tickets, start=1):
+        case_id = s(payload.get("external_id"))
+        case_number = s(payload.get("_case_number"))
+        source = s(payload.get("_migration_source")) or ("phone" if "phone" in result_prefix.lower() else "standard")
+        started = _utc_now_text()
+
+        if not case_id:
+            results.append(_build_audit_row(
+                "", case_number, source, "FAILED", started, _utc_now_text(),
+                attempts=0, error_type="MISSING_EXTERNAL_ID",
+                failure_reason="Payload has no Salesforce Case.Id / external_id.",
+                error_detail="Missing external_id in prepared payload.",
+            ))
+            continue
+
+        prior = state.get(case_id, {}) if isinstance(state, dict) else {}
+        if prior.get("status") == "manual_review_required":
+            results.append(_build_audit_row(
+                case_id, case_number, source, "MANUAL_REVIEW_REQUIRED", started, _utc_now_text(),
+                zendesk_ticket_id=prior.get("zendesk_id", ""),
+                salesforce_case_id_sent=case_id, zendesk_external_id=prior.get("zendesk_external_id", ""),
+                id_match="NO", error_type="ID_MISMATCH",
+                failure_reason="Previous run recorded this ticket for manual review; automatic retry is disabled.",
+                error_detail=prior.get("message", "Manual review required."),
+            ))
+            continue
+
+        existing_id = int(prior.get("zendesk_id") or 0) if prior.get("zendesk_id") else None
+        existing = None
+        existing_status = False
+        if not existing_id:
+            existing = zd.find_ticket_by_external_id(case_id)
+            if existing and existing.get("id"):
+                existing_id = int(existing["id"])
+                existing_status = True
+
+        if existing_id:
+            try:
+                verified = _validate_ticket_external_id(zd, existing_id, case_id, existing if existing_status else None)
+                att = _attachment_stats_for_case(attachment_rows_by_case.get(case_id, []), case_id)
+                results.append(_build_audit_row(
+                    case_id, case_number, source, "EXISTING", started, _utc_now_text(),
+                    zendesk_ticket_id=existing_id, salesforce_case_id_sent=case_id,
+                    zendesk_external_id=verified, id_match="YES", attempts=0, **att,
+                ))
+                save_ticket_state(case_id, existing_id, "existing", verified)
+            except Exception as exc:
+                detail = _safe_error_detail(exc)
+                results.append(_build_audit_row(
+                    case_id, case_number, source, "MANUAL_REVIEW_REQUIRED", started, _utc_now_text(),
+                    zendesk_ticket_id=existing_id, salesforce_case_id_sent=case_id,
+                    id_match="NO", error_type=_classify_error(detail),
+                    failure_reason=detail.splitlines()[0][:1000], error_detail=detail,
+                ))
+                save_ticket_state(case_id, existing_id, "manual_review_required", message=detail)
+            continue
+
+        try:
+            rows = attachment_rows_by_case.get(case_id, [])
+            _runtime_attach_files_to_payload(payload, rows, zd, akarsh_user_id, workspace, attachment_log)
+            att = _attachment_stats_for_case(attachment_log, case_id)
+            clean_payload = strip_private_metadata(payload)
+            if s(clean_payload.get("external_id")) != case_id:
+                raise RuntimeError(
+                    f"Payload external_id mismatch before Zendesk import. Expected '{case_id}', "
+                    f"got '{s(clean_payload.get('external_id'))}'."
+                )
+            pending.append({
+                "case_id": case_id,
+                "case_number": case_number,
+                "source": source,
+                "started": started,
+                "api_payload": clean_payload,
+                "attachment_stats": att,
+            })
+        except Exception as exc:
+            detail = _safe_error_detail(exc)
+            results.append(_build_audit_row(
+                case_id, case_number, source, "FAILED", started, _utc_now_text(),
+                salesforce_case_id_sent=case_id, id_match="NO",
+                error_type=_classify_error(detail),
+                failure_reason=detail.splitlines()[0][:1000], error_detail=detail,
+                **_attachment_stats_for_case(attachment_log, case_id),
+            ))
+            continue
+
+        if len(pending) >= BATCH_SIZE:
+            flush_pending()
+
+        if ticket_index % 100 == 0 or ticket_index == len(tickets):
+            print(
+                f"[Import Preparation] {ticket_index:,}/{len(tickets):,} payloads checked; "
+                f"{len(results):,} outcomes logged; {len(pending)} ticket(s) waiting for batch.",
+                flush=True,
+            )
+
+    flush_pending()
+
+    out = workspace / "import"
+    out.mkdir(parents=True, exist_ok=True)
+    result_xlsx = out / f"{result_prefix}.xlsx"
+    result_csv = out / f"{result_prefix}.csv"
+    result_json = out / f"{result_prefix}_Summary.json"
+
+    summary = {
+        "Total": len(results),
+        "Completed": sum(1 for r in results if r.get("Status") == "COMPLETED"),
+        "Completed with warnings": sum(1 for r in results if r.get("Status") == "COMPLETED_WITH_WARNINGS"),
+        "Existing": sum(1 for r in results if r.get("Status") == "EXISTING"),
+        "Failed": sum(1 for r in results if r.get("Status") == "FAILED"),
+        "Manual review required": sum(1 for r in results if r.get("Status") == "MANUAL_REVIEW_REQUIRED"),
+        "ID matches": sum(1 for r in results if s(r.get("ID Match")) == "YES"),
+        "ID mismatches": sum(1 for r in results if r.get("Error Type") == "ID_MISMATCH"),
+        "Attachments uploaded": sum(int(r.get("Attachments Uploaded") or 0) for r in results),
+        "Attachments failed": sum(int(r.get("Attachments Failed") or 0) for r in results),
+    }
+    _write_audit_workbook(result_xlsx, summary, results)
+    write_csv(result_csv, results)
+    write_json_compact(result_json, summary)
+    if attachment_log:
+        write_csv(out / "Attachment_Runtime_Log.csv", attachment_log)
+        modular_excel_write(out / "Attachment_Runtime_Log.xlsx", attachment_log, sheet_name="Attachment Runtime")
+
+    _write_overall_reconciliation(workspace)
+    return {
+        "total": len(results),
+        "completed": summary["Completed"],
+        "existing": summary["Existing"],
+        "failed": summary["Failed"],
+        "completed_with_warnings": summary["Completed with warnings"],
+        "manual_review_required": summary["Manual review required"],
+        "result_file": str(result_xlsx),
+    }

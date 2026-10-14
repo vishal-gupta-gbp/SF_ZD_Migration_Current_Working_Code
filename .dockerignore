@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.backup*
+.venv/
+venv/
+.env.local
+.git/
+.gitignore
+.DS_Store
+*.log
+migration_workspace/attachments/files/
+migration_workspace/s3_downloads/
+*.tmp

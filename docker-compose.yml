@@ -1,0 +1,47 @@
+services:
+  # ==============================================================================
+  # PostgreSQL 16 Database Service
+  # ==============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: migration_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-migration_db}
+      POSTGRES_USER: ${POSTGRES_USER:-migration_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-migration_pass}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-migration_user} -d ${POSTGRES_DB:-migration_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==============================================================================
+  # Migration Execution Service
+  # ==============================================================================
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: migration_app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-migration_user}:${POSTGRES_PASSWORD:-migration_pass}@postgres:5432/${POSTGRES_DB:-migration_db}
+      DOCKER_CONTAINER: "1"
+    volumes:
+      - ./migration_workspace:/app/migration_workspace
+      - ./migration:/app/migration:ro
+      - ./Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:/app/Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:ro
+    restart: "no"
+
+volumes:
+  postgres_data:
+    name: migration_postgres_data

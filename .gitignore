@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.backup*
+.venv/
+venv/
+.env
+.env.local
+.DS_Store
+*.log
+migration_workspace/
+*.db
