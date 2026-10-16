@@ -289,8 +289,17 @@ def run_step4_import(
         ticket_row: MigrationTicket = item["ticket_row"]
         case_id = ticket_row.case_id
         found = zd.find_ticket_by_external_id(case_id)
+        if not found and ticket_row.case_number:
+            res = zd.batch_find_tickets_by_external_ids([], case_numbers=[ticket_row.case_number])
+            found = res.get(ticket_row.case_number) or res.get(ticket_row.case_number.lower())
+
         if found and found.get("id"):
-            mark_success(item, int(found["id"]))
+            ticket_row.status = "existing"
+            ticket_row.zendesk_ticket_id = int(found["id"])
+            ticket_row.zendesk_external_id = str(found.get("external_id") or case_id)
+            ticket_row.completed_at = datetime.now(timezone.utc)
+            ticket_row.failure_reason = ""
+            ticket_row.error_detail = ""
             return
 
         ticket_row.status = "manual_review_required"
@@ -309,6 +318,22 @@ def run_step4_import(
             mark_success(item, ticket_id)
         except Exception as exc:
             detail = f"{fallback_reason}\n{exc}" if fallback_reason else str(exc)
+            # Check if ticket already exists in Zendesk to fail silently and avoid duplicate
+            found = zd.find_ticket_by_external_id(case_id)
+            if not found and ticket_row.case_number:
+                res = zd.batch_find_tickets_by_external_ids([], case_numbers=[ticket_row.case_number])
+                found = res.get(ticket_row.case_number) or res.get(ticket_row.case_number.lower())
+
+            if found and found.get("id"):
+                ticket_row.status = "existing"
+                ticket_row.zendesk_ticket_id = int(found["id"])
+                ticket_row.zendesk_external_id = str(found.get("external_id") or case_id)
+                ticket_row.completed_at = datetime.now(timezone.utc)
+                ticket_row.failure_reason = ""
+                ticket_row.error_detail = ""
+                print(f"  [Duplicate Handled] SF Case {ticket_row.case_number or case_id} already exists in Zendesk as Ticket {found['id']}. Skipped creation.", flush=True)
+                return
+
             if ticket_id:
                 ticket_row.status = "manual_review_required"
                 ticket_row.zendesk_ticket_id = ticket_id
@@ -331,15 +356,29 @@ def run_step4_import(
             existing_in_zd = zd.find_tickets_in_date_range(start_date, end_date)
             print(f"  [Zendesk] Found {len(existing_in_zd):,} matching tickets in Zendesk for date range.", flush=True)
 
-        unresolved_cids = [t.case_id for t in unverified if t.case_id not in existing_in_zd]
-        if unresolved_cids and len(unresolved_cids) <= 3000:
+        unresolved_cids = [
+            t.case_id for t in unverified
+            if t.case_id not in existing_in_zd and t.case_id.lower() not in existing_in_zd
+        ]
+        unresolved_cnums = [
+            t.case_number for t in unverified
+            if t.case_number and t.case_number not in existing_in_zd and t.case_number.lower() not in existing_in_zd
+        ]
+        if unresolved_cids or unresolved_cnums:
             print(f"  [Zendesk] Checking {len(unresolved_cids):,} remaining tickets via chunked search (30 IDs/req)...", flush=True)
-            chunk_results = zd.batch_find_tickets_by_external_ids(unresolved_cids, chunk_size=30)
+            chunk_results = zd.batch_find_tickets_by_external_ids(
+                unresolved_cids, case_numbers=unresolved_cnums, chunk_size=30
+            )
             existing_in_zd.update(chunk_results)
 
         matched_count = 0
         for t in unverified:
-            ext_data = existing_in_zd.get(t.case_id) or existing_in_zd.get(t.case_id.lower())
+            ext_data = (
+                existing_in_zd.get(t.case_id)
+                or existing_in_zd.get(t.case_id.lower())
+                or (existing_in_zd.get(t.case_number) if t.case_number else None)
+                or (existing_in_zd.get(t.case_number.lower()) if t.case_number else None)
+            )
             if ext_data and ext_data.get("id"):
                 t.status = "existing"
                 t.zendesk_ticket_id = int(ext_data["id"])
@@ -348,7 +387,7 @@ def run_step4_import(
                 matched_count += 1
         if matched_count > 0:
             session.commit()
-            print(f"Database synchronized: {matched_count:,} tickets were already present in Zendesk and marked 'existing'.", flush=True)
+            print(f"Database synchronized: {matched_count:,} duplicate tickets already present in Zendesk were marked 'existing' and skipped.", flush=True)
 
     tickets_to_import = [t for t in tickets if t.status in ("prepared", "failed", "importing") and not t.zendesk_ticket_id]
     if not tickets_to_import:

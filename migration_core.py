@@ -1778,7 +1778,14 @@ def export_salesforce_data(
         # Inclusive end date: use the next day as the exclusive upper bound.
         next_day = parsed_end + timedelta(days=1)
         filters.append(f"CreatedDate < {next_day.isoformat()}T00:00:00Z")
-        # filters.append("BP_Case_Number_FD__c != null")
+
+    active_source_filter = os.getenv("SF_SOURCE_FILTER", "").lower().strip()
+    if active_source_filter in {"portal_api", "portal", "ticket_api", "portal_ticket_api"}:
+        print("Applying Source Filter: ONLY 'Portal (Ticket API)' cases [BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')]")
+        filters.append("BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')")
+    elif active_source_filter in {"non_portal_api", "non_portal", "exclude_portal_api"}:
+        print("Applying Source Filter: ONLY NON-'Portal (Ticket API)' cases [(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)]")
+        filters.append("(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)")
 
     where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -4652,6 +4659,13 @@ def import_prepared_tickets_modular(
         existing_status = False
         if not existing_id:
             existing = zd.find_ticket_by_external_id(case_id)
+            if not existing and case_number:
+                # Also check Zendesk by case_number to detect duplicates migrated earlier
+                q_num = zd.request("GET", "/api/v2/search.json", params={"query": f'type:ticket "{case_number}"', "per_page": 5})
+                if q_num.status_code == 200:
+                    res_items = q_num.json().get("results", [])
+                    if res_items:
+                        existing = res_items[0]
             if existing and existing.get("id"):
                 existing_id = int(existing["id"])
                 existing_status = True

@@ -45,12 +45,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--end-date", required=True, help="YYYY-MM-DD (inclusive)")
     run_p.add_argument("--max-tickets", type=int, default=None, help="Limit number of tickets (0 = all)")
     run_p.add_argument("--archive-immediately", action="store_true", help="Archive tickets immediately in Zendesk")
+    run_p.add_argument(
+        "--source-filter",
+        default=None,
+        choices=["all", "portal_api", "non_portal_api"],
+        help="Filter Salesforce cases by BP_Source__c ('portal_api', 'non_portal_api', or 'all')",
+    )
 
     # Command: export (step 1)
     exp_p = subparsers.add_parser("export", parents=[shared], help="Step 1: Export Salesforce data & download S3 attachments")
     exp_p.add_argument("--start-date", required=True, help="YYYY-MM-DD")
     exp_p.add_argument("--end-date", required=True, help="YYYY-MM-DD")
     exp_p.add_argument("--max-tickets", type=int, default=None)
+    exp_p.add_argument(
+        "--source-filter",
+        default=None,
+        choices=["all", "portal_api", "non_portal_api"],
+        help="Filter Salesforce cases by BP_Source__c ('portal_api', 'non_portal_api', or 'all')",
+    )
 
     # Command: entities (step 2)
     subparsers.add_parser("entities", parents=[shared], help="Step 2: Sync Zendesk Organizations and End Users")
@@ -92,6 +104,8 @@ def main(args: Optional[list] = None) -> int:
     settings = load_config(parsed.config)
     if parsed.db_url:
         settings.database_url = parsed.db_url
+    if getattr(parsed, "source_filter", None):
+        settings.source_filter = parsed.source_filter.lower().strip()
 
     engine = init_engine(settings.database_url)
     init_db(engine)

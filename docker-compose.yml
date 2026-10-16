@@ -39,6 +39,12 @@ services:
     volumes:
       - ./migration_workspace:/app/migration_workspace
       - ./migration:/app/migration:ro
+      - ./00_run_migration.py:/app/00_run_migration.py:ro
+      - ./01_export.py:/app/01_export.py:ro
+      - ./02_migrate_entities.py:/app/02_migrate_entities.py:ro
+      - ./03_prepare_tickets.py:/app/03_prepare_tickets.py:ro
+      - ./04_import_standard_tickets.py:/app/04_import_standard_tickets.py:ro
+      - ./05_import_phone_tickets.py:/app/05_import_phone_tickets.py:ro
       - ./Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:/app/Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:ro
     restart: "no"
 

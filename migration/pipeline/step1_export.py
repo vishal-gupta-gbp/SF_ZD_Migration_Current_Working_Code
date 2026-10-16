@@ -106,6 +106,7 @@ def run_step1_export(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     max_tickets: Optional[int] = None,
+    source_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute Step 1: Export Salesforce data and download attachments into database."""
     print("=" * 68)
@@ -113,6 +114,7 @@ def run_step1_export(
     print("=" * 68)
 
     limit_val = max_tickets if max_tickets is not None else settings.max_tickets
+    active_source_filter = (source_filter or settings.source_filter or "all").lower().strip()
     sf = SalesforceClient(
         base_url=settings.salesforce.base_url,
         client_id=settings.salesforce.consumer_key,
@@ -123,7 +125,7 @@ def run_step1_export(
     sf.authenticate()
     print("Salesforce authentication successful.")
 
-    # Build date filters
+    # Build date & source filters
     filters: List[str] = []
     if start_date:
         parsed_start = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -132,6 +134,15 @@ def run_step1_export(
         parsed_end = datetime.strptime(end_date, "%Y-%m-%d").date()
         next_day = parsed_end + timedelta(days=1)
         filters.append(f"CreatedDate < {next_day.isoformat()}T00:00:00Z")
+
+    if active_source_filter in {"portal_api", "portal", "ticket_api", "portal_ticket_api"}:
+        print("Applying Source Filter: ONLY 'Portal (Ticket API)' cases [BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')]")
+        filters.append("BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')")
+    elif active_source_filter in {"non_portal_api", "non_portal", "exclude_portal_api"}:
+        print("Applying Source Filter: ONLY NON-'Portal (Ticket API)' cases [(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)]")
+        filters.append("(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)")
+    else:
+        print(f"Source Filter: ALL sources (no BP_Source__c filter applied)")
 
     where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
     fields = build_case_select_fields(sf, session)
