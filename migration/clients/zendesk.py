@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import mimetypes
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -380,32 +381,68 @@ class ZendeskClient:
         tickets = [r for r in results if r.get("result_type") == "ticket" or "ticket" in str(r.get("url") or "").lower()]
         return tickets[0] if tickets else None
 
+    def _index_ticket_identifiers(self, ticket_item: Dict[str, Any], index_dict: Dict[str, Dict[str, Any]]) -> None:
+        """Helper to index a ticket by external_id, SF Ticket Number custom field, and subject case number."""
+        ext = str(ticket_item.get("external_id") or "").strip()
+        if ext:
+            index_dict[ext] = ticket_item
+            index_dict[ext.lower()] = ticket_item
+
+        # Index by custom_fields (SF Ticket Number custom field ID: 30867591650204)
+        for cf in ticket_item.get("custom_fields", []):
+            if cf.get("id") == 30867591650204 and cf.get("value"):
+                cnum = str(cf["value"]).strip()
+                if cnum:
+                    index_dict[cnum] = ticket_item
+                    index_dict[cnum.lower()] = ticket_item
+
+        # Index by CaseNumber from Subject (e.g. "Salesforce Case 02879137")
+        subj = str(ticket_item.get("subject") or "")
+        match = re.search(r"\b(\d{7,10})\b", subj)
+        if match:
+            cnum = match.group(1)
+            index_dict[cnum] = ticket_item
+            index_dict[cnum.lower()] = ticket_item
+
     def batch_find_tickets_by_external_ids(
-        self, external_ids: List[str], chunk_size: int = 30
+        self,
+        external_ids: List[str],
+        case_numbers: Optional[List[str]] = None,
+        chunk_size: int = 30,
     ) -> Dict[str, Dict[str, Any]]:
-        """Find multiple tickets by external_ids in Zendesk using chunked search queries (30 IDs per request)."""
+        """Find multiple tickets by external_ids and case_numbers in Zendesk using chunked search queries."""
         result: Dict[str, Dict[str, Any]] = {}
         unique_ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
-        if not unique_ids:
-            return result
+        if unique_ids:
+            for i in range(0, len(unique_ids), chunk_size):
+                chunk = unique_ids[i : i + chunk_size]
+                query = "type:ticket " + " ".join(f"external_id:{cid}" for cid in chunk)
+                resp = self.request("GET", "/api/v2/search.json", params={"query": query, "per_page": 100})
+                if resp.status_code == 200:
+                    for item in resp.json().get("results", []):
+                        self._index_ticket_identifiers(item, result)
 
-        for i in range(0, len(unique_ids), chunk_size):
-            chunk = unique_ids[i : i + chunk_size]
-            query = "type:ticket " + " ".join(f"external_id:{cid}" for cid in chunk)
-            resp = self.request("GET", "/api/v2/search.json", params={"query": query, "per_page": 100})
-            if resp.status_code == 200:
-                for item in resp.json().get("results", []):
-                    ext = str(item.get("external_id") or "").strip()
-                    if ext:
-                        result[ext] = item
-                        result[ext.lower()] = item
+        if case_numbers:
+            # Query any case numbers that were not resolved by external_id
+            unresolved_nums = [
+                str(cn).strip() for cn in case_numbers
+                if str(cn).strip() and str(cn).strip() not in result and str(cn).strip().lower() not in result
+            ]
+            unique_nums = list(dict.fromkeys(unresolved_nums))
+            for i in range(0, len(unique_nums), chunk_size):
+                chunk = unique_nums[i : i + chunk_size]
+                query = "type:ticket " + " ".join(f'"{cnum}"' for cnum in chunk)
+                resp = self.request("GET", "/api/v2/search.json", params={"query": query, "per_page": 100})
+                if resp.status_code == 200:
+                    for item in resp.json().get("results", []):
+                        self._index_ticket_identifiers(item, result)
 
         return result
 
     def find_tickets_in_date_range(
         self, start_date: str, end_date: str, max_pages: int = 50
     ) -> Dict[str, Dict[str, Any]]:
-        """Paginate Zendesk search for all tickets created in date range and map external_id -> ticket."""
+        """Paginate Zendesk search for all tickets created in date range and map identifiers -> ticket."""
         result: Dict[str, Dict[str, Any]] = {}
         query = f"type:ticket created>={start_date}T00:00:00Z created<={end_date}T23:59:59Z"
         url = "/api/v2/search.json"
@@ -419,10 +456,7 @@ class ZendeskClient:
             data = resp.json()
             items = data.get("results", [])
             for item in items:
-                ext = str(item.get("external_id") or "").strip()
-                if ext:
-                    result[ext] = item
-                    result[ext.lower()] = item
+                self._index_ticket_identifiers(item, result)
 
             pages += 1
             next_url = data.get("next_page")

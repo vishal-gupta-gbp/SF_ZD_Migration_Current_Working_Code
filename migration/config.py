@@ -70,6 +70,9 @@ class MigrationSettings:
     association_type_field_id: int = 30064365242012
     group_custom_field_id: int = 30114110837404
 
+    # Source filtering: 'all', 'portal_api', 'non_portal_api'
+    source_filter: str = "all"
+
 
 def load_config(config_path: Optional[Path | str] = None) -> MigrationSettings:
     """Load configuration from environment variables (with optional JSON file overrides)."""
@@ -146,4 +149,5 @@ def load_config(config_path: Optional[Path | str] = None) -> MigrationSettings:
         s3_download_concurrency=int(os.getenv("S3_DOWNLOAD_CONCURRENCY", 8)),
         zd_upload_concurrency=int(os.getenv("ZD_UPLOAD_CONCURRENCY", 5)),
         zd_bulk_import_batch_size=int(os.getenv("ZD_BULK_IMPORT_BATCH_SIZE", 100)),
+        source_filter=os.getenv("SF_SOURCE_FILTER", cfg_data.get("source_filter", "all")).lower().strip(),
     )

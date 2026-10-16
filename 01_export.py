@@ -20,11 +20,19 @@ def main():
     p.add_argument("--end-date", required=True, help="YYYY-MM-DD, inclusive")
     p.add_argument("--max-tickets", type=int, default=None, help="0 = all selected Cases")
     p.add_argument("--db-url", default=None, help="Override database URL")
+    p.add_argument(
+        "--source-filter",
+        default=None,
+        choices=["all", "portal_api", "non_portal_api"],
+        help="Filter Salesforce cases by BP_Source__c ('portal_api' for Portal (Ticket API), 'non_portal_api', or 'all')",
+    )
     a = p.parse_args()
 
     settings = load_config(a.config)
     if a.db_url:
         settings.database_url = a.db_url
+    if a.source_filter:
+        settings.source_filter = a.source_filter.lower().strip()
 
     engine = init_engine(settings.database_url)
     init_db(engine)

@@ -25,6 +25,12 @@ def parse_args():
     p.add_argument("--config", default=None, help="Optional path to config JSON file")
     p.add_argument("--archive-immediately", action="store_true")
     p.add_argument("--db-url", default=None, help="Override database URL")
+    p.add_argument(
+        "--source-filter",
+        default=None,
+        choices=["all", "portal_api", "non_portal_api"],
+        help="Filter Salesforce cases by BP_Source__c ('portal_api' for Portal (Ticket API), 'non_portal_api', or 'all')",
+    )
     return p.parse_args()
 
 
@@ -33,6 +39,8 @@ def main():
     settings = load_config(args.config)
     if args.db_url:
         settings.database_url = args.db_url
+    if args.source_filter:
+        settings.source_filter = args.source_filter.lower().strip()
 
     if args.max_tickets is not None:
         if args.max_tickets < 0:

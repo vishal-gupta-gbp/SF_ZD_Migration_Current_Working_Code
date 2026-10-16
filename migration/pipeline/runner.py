@@ -25,9 +25,11 @@ def run_full_migration(
     end_date: str,
     max_tickets: Optional[int] = None,
     archive_immediately: Optional[bool] = None,
+    source_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute the complete end-to-end migration pipeline."""
     limit_val = max_tickets if max_tickets is not None else settings.max_tickets
+    active_source = (source_filter or settings.source_filter or "all").lower().strip()
 
     print("=" * 70)
     print("SALESFORCE -> ZENDESK DATABASE-BACKED MIGRATION PIPELINE")
@@ -70,6 +72,7 @@ def run_full_migration(
                 start_date=start_date,
                 end_date=end_date,
                 max_tickets=limit_val,
+                source_filter=active_source,
             )
             summary["step1_export"] = s1
 
