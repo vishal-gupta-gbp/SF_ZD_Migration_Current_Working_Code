@@ -32,23 +32,41 @@ class ZendeskClient:
         self._brands_cache: Optional[List[Dict[str, Any]]] = None
 
     def authenticate(self) -> None:
-        """Authenticate using client credentials grant."""
+        """Authenticate using client credentials grant with 2 retries."""
         token_url = f"{self.base_url}/oauth/tokens"
-        response = self.session.post(
-            token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "scope": self.scope,
-            },
-            timeout=60,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Zendesk OAuth authentication failed (HTTP {response.status_code}):\n{response.text[:3000]}"
-            )
-        self.access_token = response.json()["access_token"]
+        last_error: Any = None
+        for attempt in range(1, 4):
+            try:
+                response = self.session.post(
+                    token_url,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                        "scope": self.scope,
+                    },
+                    timeout=60,
+                )
+                if response.status_code == 200:
+                    self.access_token = response.json()["access_token"]
+                    return
+                last_error = RuntimeError(
+                    f"Zendesk OAuth authentication failed (HTTP {response.status_code}):\n{response.text[:3000]}"
+                )
+                if attempt < 3:
+                    print(f"  [Zendesk] Auth attempt {attempt} failed (HTTP {response.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    print(f"  [Zendesk] Auth attempt {attempt} exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+                raise
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise RuntimeError(f"Zendesk OAuth authentication failed: {last_error}")
 
     def request(
         self,
@@ -74,9 +92,10 @@ class ZendeskClient:
                     },
                     timeout=90,
                 )
-            except (requests.Timeout, requests.ConnectionError):
-                if attempt == 6:
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+                if attempt >= 3 and attempt == 6:
                     raise
+                print(f"  [Zendesk] Request to {url} failed ({exc}). Retrying attempt {attempt}/2...", flush=True)
                 time.sleep(min(60, 2 ** (attempt - 1)))
                 continue
 
@@ -326,6 +345,10 @@ class ZendeskClient:
                 continue
 
             if resp.status_code != 201:
+                if attempt < 3:
+                    print(f"  [Zendesk] Upload failed for {filename} (HTTP {resp.status_code}). Retrying attempt {attempt}/2...", flush=True)
+                    time.sleep(2)
+                    continue
                 raise RuntimeError(f"Zendesk upload failed for {filename} (HTTP {resp.status_code}):\n{resp.text[:2000]}")
 
             token = resp.json().get("upload", {}).get("token")
@@ -338,33 +361,66 @@ class ZendeskClient:
     def submit_bulk_ticket_import_job(
         self, batch_payloads: List[Dict[str, Any]], archive_immediately: bool = False
     ) -> Dict[str, Any]:
-        """Submit up to 100 tickets to the Bulk Import API."""
-        resp = self.request(
-            "POST",
-            "/api/v2/imports/tickets/create_many.json",
-            params={"archive_immediately": str(archive_immediately).lower()},
-            json_body={"tickets": batch_payloads},
-        )
-        if resp.status_code not in {200, 201, 202}:
-            raise ZendeskBulkImportError(resp.status_code, resp.text[:5000])
-
-        data = resp.json()
-        job = data.get("job_status") or data
-        return job
+        """Submit up to 100 tickets to the Bulk Import API with 2-time retry mechanism."""
+        last_error: Any = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.request(
+                    "POST",
+                    "/api/v2/imports/tickets/create_many.json",
+                    params={"archive_immediately": str(archive_immediately).lower()},
+                    json_body={"tickets": batch_payloads},
+                )
+                if resp.status_code in {200, 201, 202}:
+                    data = resp.json()
+                    job = data.get("job_status") or data
+                    return job
+                last_error = ZendeskBulkImportError(resp.status_code, resp.text[:5000])
+                if attempt < 3:
+                    print(f"  [Zendesk] Bulk import job submission attempt {attempt} failed (HTTP {resp.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    print(f"  [Zendesk] Bulk import job submission attempt {attempt} exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+                raise
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise ZendeskBulkImportError(500, f"Bulk ticket import failed after 2 retries: {last_error}")
 
     def import_single_ticket(
         self, ticket_payload: Dict[str, Any], archive_immediately: bool = False
     ) -> Dict[str, Any]:
-        """Single ticket import fallback."""
-        resp = self.request(
-            "POST",
-            "/api/v2/imports/tickets.json",
-            params={"archive_immediately": str(archive_immediately).lower()},
-            json_body={"ticket": ticket_payload},
-        )
-        if resp.status_code != 201:
-            raise RuntimeError(f"Single ticket import failed (HTTP {resp.status_code}): {resp.text[:2000]}")
-        return resp.json().get("ticket", {})
+        """Single ticket import fallback with 2-time retry mechanism."""
+        last_error: Any = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.request(
+                    "POST",
+                    "/api/v2/imports/tickets.json",
+                    params={"archive_immediately": str(archive_immediately).lower()},
+                    json_body={"ticket": ticket_payload},
+                )
+                if resp.status_code == 201:
+                    return resp.json().get("ticket", {})
+                last_error = RuntimeError(f"Single ticket import failed (HTTP {resp.status_code}): {resp.text[:2000]}")
+                if attempt < 3:
+                    print(f"  [Zendesk] Single ticket import attempt {attempt} failed (HTTP {resp.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(1.5)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    print(f"  [Zendesk] Single ticket import attempt {attempt} exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(1.5)
+                    continue
+                raise
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise RuntimeError(str(last_error))
 
     def get_ticket(self, ticket_id: int) -> Dict[str, Any]:
         resp = self.request("GET", f"/api/v2/tickets/{int(ticket_id)}.json")

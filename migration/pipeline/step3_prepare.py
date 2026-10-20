@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from migration.clients.zendesk import ZendeskClient
@@ -22,7 +23,13 @@ from migration.db.models import (
     ZendeskOrganization,
     ZendeskUser,
 )
-from migration.engine.field_mapper import DatabaseFieldMapper, normalize_label, s
+from migration.engine.field_mapper import (
+    BRAND_PRODUCT_MAP,
+    DatabaseFieldMapper,
+    normalize_label,
+    resolve_brand_and_product,
+    s,
+)
 from migration.engine.identity_resolver import norm, valid_email
 from migration.engine.payload_builder import build_ticket_payload
 
@@ -33,6 +40,7 @@ def run_step3_prepare(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     max_tickets: Optional[int] = None,
+    ticket_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute Step 3: Prepare Zendesk ticket payloads and persist in migration_tickets DB table."""
     print("=" * 68)
@@ -73,8 +81,15 @@ def run_step3_prepare(
         if u.source_email and u.zendesk_user_id
     }
 
-    # Load Cases from DB (filtered by date range if provided)
+    # Load Cases from DB (filtered by ticket_ids or date range if provided)
     case_query = session.query(SFCase).order_by(SFCase.created_date.asc())
+    if ticket_ids:
+        case_query = case_query.filter(
+            or_(
+                SFCase.id.in_(ticket_ids),
+                SFCase.case_number.in_(ticket_ids),
+            )
+        )
     if start_date:
         case_query = case_query.filter(SFCase.created_date >= f"{start_date}T00:00:00Z")
     if end_date:
@@ -86,7 +101,12 @@ def run_step3_prepare(
     if limit_val > 0:
         case_query = case_query.limit(limit_val)
     cases = case_query.all()
-    date_str = f" for date range {start_date} -> {end_date}" if start_date or end_date else ""
+    filter_desc = []
+    if ticket_ids:
+        filter_desc.append(f"{len(ticket_ids)} ticket IDs")
+    if start_date or end_date:
+        filter_desc.append(f"date range {start_date} -> {end_date}")
+    date_str = f" for ({', '.join(filter_desc)})" if filter_desc else ""
     print(f"Loaded {len(cases):,} Cases from database{date_str}.", flush=True)
 
     # Load related entities from DB
@@ -139,10 +159,19 @@ def run_step3_prepare(
                 group_map[normalize_label(grp)] = int(zg["id"])
                 group_map[normalize_label(mapped_grp)] = int(zg["id"])
 
+    # Pre-cache brand mappings from static map and dynamic lookup
     brand_map: Dict[str, int] = {}
+    for k, v in BRAND_PRODUCT_MAP.items():
+        brand_map[normalize_label(k)] = int(v["brand_id"])
+        brand_map[normalize_label(v["brand_name"])] = int(v["brand_id"])
+
     for c in cases:
         prd = c.raw_data_json.get("BP_Product__c") if c.raw_data_json else None
         if prd and normalize_label(prd) not in brand_map:
+            bp_info = resolve_brand_and_product(prd)
+            if bp_info:
+                brand_map[normalize_label(prd)] = int(bp_info["brand_id"])
+                continue
             mapped_brand = mapper.mapped_zendesk_value("BP_Product__c", prd) or prd
             zb = zd.find_brand_by_name(mapped_brand)
             if zb and zb.get("id"):

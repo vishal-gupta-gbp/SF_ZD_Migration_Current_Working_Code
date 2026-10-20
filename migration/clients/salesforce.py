@@ -38,24 +38,42 @@ class SalesforceClient:
         self._describe_cache: Dict[str, Set[str]] = {}
 
     def authenticate(self) -> None:
-        """Authenticate with Salesforce OAuth2 using client_credentials grant."""
+        """Authenticate with Salesforce OAuth2 using client_credentials grant with 2 retries."""
         token_url = f"{self.base_url}/services/oauth2/token"
-        response = self.session.post(
-            token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-            },
-            timeout=60,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Salesforce OAuth authentication failed (HTTP {response.status_code}):\n{response.text[:3000]}"
-            )
-        data = response.json()
-        self.access_token = data["access_token"]
-        self.instance_url = data.get("instance_url", self.base_url).rstrip("/")
+        last_error: Any = None
+        for attempt in range(1, 4):
+            try:
+                response = self.session.post(
+                    token_url,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                    },
+                    timeout=60,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self.access_token = data["access_token"]
+                    self.instance_url = data.get("instance_url", self.base_url).rstrip("/")
+                    return
+                last_error = RuntimeError(
+                    f"Salesforce OAuth authentication failed (HTTP {response.status_code}):\n{response.text[:3000]}"
+                )
+                if attempt < 3:
+                    print(f"  [Salesforce] Auth attempt {attempt} failed (HTTP {response.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    print(f"  [Salesforce] Auth attempt {attempt} exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+                raise
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise RuntimeError(f"Salesforce OAuth authentication failed: {last_error}")
 
     def request(
         self,
@@ -81,9 +99,10 @@ class SalesforceClient:
                     },
                     timeout=90,
                 )
-            except (requests.Timeout, requests.ConnectionError):
-                if attempt == 6:
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+                if attempt >= 3:
                     raise
+                print(f"  [Salesforce] Request to {url} failed ({exc}). Retrying attempt {attempt}/2...", flush=True)
                 time.sleep(min(60, 2 ** (attempt - 1)))
                 continue
 

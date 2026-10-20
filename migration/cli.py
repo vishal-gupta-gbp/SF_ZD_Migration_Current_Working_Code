@@ -26,6 +26,15 @@ from migration.pipeline.step4_import import run_step4_import
 from migration.reports.exporter import export_migration_reports
 
 
+def parse_ticket_ids(val: Optional[str]) -> Optional[List[str]]:
+    """Parse comma-separated Salesforce Ticket/Case IDs or Case Numbers."""
+    if not val:
+        return None
+    ids = [x.strip().strip("'\"") for x in val.split(",")]
+    cleaned = [x for x in ids if x]
+    return cleaned if cleaned else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--config", default=None, help="Optional path to config JSON file")
@@ -41,8 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Command: run (full pipeline)
     run_p = subparsers.add_parser("run", parents=[shared], help="Run full migration pipeline (steps 1 to 5)")
-    run_p.add_argument("--start-date", required=True, help="YYYY-MM-DD")
-    run_p.add_argument("--end-date", required=True, help="YYYY-MM-DD (inclusive)")
+    run_p.add_argument("--start-date", default=None, help="YYYY-MM-DD")
+    run_p.add_argument("--end-date", default=None, help="YYYY-MM-DD (inclusive)")
+    run_p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
     run_p.add_argument("--max-tickets", type=int, default=None, help="Limit number of tickets (0 = all)")
     run_p.add_argument("--archive-immediately", action="store_true", help="Archive tickets immediately in Zendesk")
     run_p.add_argument(
@@ -54,8 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Command: export (step 1)
     exp_p = subparsers.add_parser("export", parents=[shared], help="Step 1: Export Salesforce data & download S3 attachments")
-    exp_p.add_argument("--start-date", required=True, help="YYYY-MM-DD")
-    exp_p.add_argument("--end-date", required=True, help="YYYY-MM-DD")
+    exp_p.add_argument("--start-date", default=None, help="YYYY-MM-DD")
+    exp_p.add_argument("--end-date", default=None, help="YYYY-MM-DD")
+    exp_p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
     exp_p.add_argument("--max-tickets", type=int, default=None)
     exp_p.add_argument(
         "--source-filter",
@@ -65,12 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Command: entities (step 2)
-    subparsers.add_parser("entities", parents=[shared], help="Step 2: Sync Zendesk Organizations and End Users")
+    ent_p = subparsers.add_parser("entities", parents=[shared], help="Step 2: Sync Zendesk Organizations and End Users")
+    ent_p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
 
     # Command: prepare (step 3)
     prep_p = subparsers.add_parser("prepare", parents=[shared], help="Step 3: Prepare Zendesk ticket payloads in database")
     prep_p.add_argument("--start-date", default=None)
     prep_p.add_argument("--end-date", default=None)
+    prep_p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
     prep_p.add_argument("--max-tickets", type=int, default=None)
 
     # Command: import (step 4 & 5)
@@ -79,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp_p.add_argument("--archive-immediately", action="store_true")
     imp_p.add_argument("--start-date", default=None, help="YYYY-MM-DD")
     imp_p.add_argument("--end-date", default=None, help="YYYY-MM-DD")
+    imp_p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
 
     # Command: seed (mappings)
     seed_p = subparsers.add_parser("seed", parents=[shared], help="Seed mapping tables into database from Excel")
@@ -107,11 +121,14 @@ def main(args: Optional[list] = None) -> int:
     if getattr(parsed, "source_filter", None):
         settings.source_filter = parsed.source_filter.lower().strip()
 
+    ticket_ids = parse_ticket_ids(getattr(parsed, "ticket_ids", None))
+
     engine = init_engine(settings.database_url)
     init_db(engine)
 
     if not parsed.command or parsed.command == "run":
-        if not hasattr(parsed, "start_date") or not parsed.start_date:
+        if not parsed.start_date and not ticket_ids:
+            print("Error: Either --start-date or --ticket-ids must be provided.", file=sys.stderr)
             parser.print_help()
             return 1
         run_full_migration(
@@ -120,10 +137,14 @@ def main(args: Optional[list] = None) -> int:
             end_date=parsed.end_date,
             max_tickets=parsed.max_tickets,
             archive_immediately=parsed.archive_immediately,
+            ticket_ids=ticket_ids,
         )
         return 0
 
     elif parsed.command == "export":
+        if not parsed.start_date and not ticket_ids:
+            print("Error: Either --start-date or --ticket-ids must be provided.", file=sys.stderr)
+            return 1
         with get_db() as session:
             seed_mappings_if_needed(session, settings.mapping_file)
             run_step1_export(
@@ -132,12 +153,13 @@ def main(args: Optional[list] = None) -> int:
                 start_date=parsed.start_date,
                 end_date=parsed.end_date,
                 max_tickets=parsed.max_tickets,
+                ticket_ids=ticket_ids,
             )
         return 0
 
     elif parsed.command == "entities":
         with get_db() as session:
-            run_step2_entities(settings=settings, session=session)
+            run_step2_entities(settings=settings, session=session, ticket_ids=ticket_ids)
         return 0
 
     elif parsed.command == "prepare":
@@ -149,6 +171,7 @@ def main(args: Optional[list] = None) -> int:
                 start_date=parsed.start_date,
                 end_date=parsed.end_date,
                 max_tickets=parsed.max_tickets,
+                ticket_ids=ticket_ids,
             )
         return 0
 
@@ -162,6 +185,7 @@ def main(args: Optional[list] = None) -> int:
                 archive_immediately=parsed.archive_immediately,
                 start_date=parsed.start_date,
                 end_date=parsed.end_date,
+                ticket_ids=ticket_ids,
             )
         return 0
 
