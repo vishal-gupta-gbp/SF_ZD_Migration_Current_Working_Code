@@ -12,7 +12,14 @@ from sqlalchemy.orm import Session
 from migration.clients.zendesk import ZendeskBulkImportError, ZendeskClient
 from migration.config import MigrationSettings
 from migration.db.models import MigrationAttachment, MigrationAuditLog, MigrationTicket, SFCase
-from migration.engine.field_mapper import s
+from migration.engine.enquiry_mapper import (
+    ENQUIRY_QUERY_ISSUE_FIELD_ID,
+    ENQUIRY_TEXT_FIELD_ID,
+    QUERY_TEXT_FIELD_ID,
+    QUERY_RELATED_ISSUE_TEXT_FIELD_ID,
+    resolve_enquiry_query_issue,
+)
+from migration.engine.field_mapper import PRODUCT_FIELD_ID, resolve_brand_and_product, s
 
 
 def strip_private_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,11 +52,14 @@ def run_step4_import(
     archive_immediately: Optional[bool] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    ticket_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute Ticket Import in batches of up to 100 with runtime attachment linking and exact external_id verification."""
     label = f"{ticket_type.upper() if ticket_type else 'ALL'} TICKETS"
     print("=" * 68)
     print(f"IMPORTING {label} INTO ZENDESK (BULK IMPORT & DATABASE TRACKED)")
+    if ticket_ids:
+        print(f"Ticket IDs Scope: {len(ticket_ids)} specified ticket(s)")
     if start_date or end_date:
         print(f"Date Scope: {start_date or 'ALL'} -> {end_date or 'ALL'}")
     print("=" * 68)
@@ -68,10 +78,26 @@ def run_step4_import(
         raise RuntimeError(f"Zendesk agent not found for {settings.agent_comment_email}.")
     akarsh_user_id = int(akarsh["id"])
 
-    # Query tickets to import from DB (filtered by ticket_type and date range)
-    query = session.query(MigrationTicket).filter(
-        MigrationTicket.status.in_(["prepared", "importing", "failed"])
-    )
+    # Query tickets to import from DB (filtered by ticket_type, ticket_ids, and date range)
+    if ticket_ids:
+        from sqlalchemy import or_
+        query = session.query(MigrationTicket).filter(
+            or_(
+                MigrationTicket.case_id.in_(ticket_ids),
+                MigrationTicket.case_number.in_(ticket_ids),
+            )
+        )
+    else:
+        from sqlalchemy import and_, or_
+        query = session.query(MigrationTicket).filter(
+            or_(
+                MigrationTicket.status.in_(["prepared", "importing", "failed"]),
+                and_(
+                    MigrationTicket.status == "manual_review_required",
+                    MigrationTicket.zendesk_ticket_id.is_(None),
+                ),
+            )
+        )
     if ticket_type:
         query = query.filter_by(ticket_type=ticket_type)
     if start_date or end_date:
@@ -91,6 +117,14 @@ def run_step4_import(
         )
         if ticket_type:
             completed_query = completed_query.filter_by(ticket_type=ticket_type)
+        if ticket_ids:
+            from sqlalchemy import or_
+            completed_query = completed_query.filter(
+                or_(
+                    MigrationTicket.case_id.in_(ticket_ids),
+                    MigrationTicket.case_number.in_(ticket_ids),
+                )
+            )
         if start_date or end_date:
             completed_query = completed_query.join(SFCase, MigrationTicket.case_id == SFCase.id)
             if start_date:
@@ -123,16 +157,20 @@ def run_step4_import(
             return None
 
         mime = att.content_type or mimetypes.guess_type(att.file_name)[0] or "application/octet-stream"
-        try:
-            token = zd.upload_file(local_path, att.file_name or local_path.name, content_type=mime)
-            att.upload_token = token
-            att.upload_status = "success"
-            att.upload_error = ""
-            return token
-        except Exception as exc:
-            att.upload_status = "failed"
-            att.upload_error = str(exc)
-            return None
+        for attempt in range(1, 4):
+            try:
+                token = zd.upload_file(local_path, att.file_name or local_path.name, content_type=mime)
+                att.upload_token = token
+                att.upload_status = "success"
+                att.upload_error = ""
+                return token
+            except Exception as exc:
+                if attempt < 3:
+                    time.sleep(1.5)
+                    continue
+                att.upload_status = "failed"
+                att.upload_error = str(exc)
+                return None
 
     def link_attachments_to_payload(case_id: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int, int]:
         case_atts = attachments_by_case.get(case_id, [])
@@ -389,7 +427,10 @@ def run_step4_import(
             session.commit()
             print(f"Database synchronized: {matched_count:,} duplicate tickets already present in Zendesk were marked 'existing' and skipped.", flush=True)
 
-    tickets_to_import = [t for t in tickets if t.status in ("prepared", "failed", "importing") and not t.zendesk_ticket_id]
+    tickets_to_import = [
+        t for t in tickets
+        if t.status in ("prepared", "failed", "importing", "manual_review_required") and not t.zendesk_ticket_id
+    ]
     if not tickets_to_import:
         print(f"All {len(tickets):,} {label.lower()} are confirmed in Zendesk! Zero import calls needed.")
         return {
@@ -404,6 +445,13 @@ def run_step4_import(
 
     print(f"Proceeding to import {len(tickets_to_import):,} remaining new tickets into Zendesk...", flush=True)
 
+    target_cids = [t.case_id for t in tickets_to_import]
+    cases_lookup: Dict[str, Dict[str, Any]] = {}
+    if target_cids:
+        chunk_cids = target_cids[:5000]
+        for c in session.query(SFCase).filter(SFCase.id.in_(chunk_cids)).all():
+            cases_lookup[c.id] = dict(c.raw_data_json or {})
+
     pending_batch: List[Dict[str, Any]] = []
 
     for index, t in enumerate(tickets_to_import, start=1):
@@ -417,6 +465,63 @@ def run_step4_import(
             continue
 
         raw_payload["external_id"] = case_id
+
+        # Ensure mandatory Enquiry Query Issue field is present in payload before import
+        cf_list = list(raw_payload.get("custom_fields") or [])
+        cf_ids = {int(f["id"]) for f in cf_list if "id" in f and f["id"]}
+        if ENQUIRY_QUERY_ISSUE_FIELD_ID not in cf_ids:
+            case_data = cases_lookup.get(case_id, {})
+            enquiry_val = s(case_data.get("bp_enquiry__c") or case_data.get("BP_Enquiry__c"))
+            query_val = s(case_data.get("bp_query__c") or case_data.get("BP_Query__c") or case_data.get("bp_query_b2b__c") or case_data.get("BP_Query_B2B__c"))
+            issue_val = s(case_data.get("bp_query_related_issue__c") or case_data.get("BP_Query_Related_Issue__c") or case_data.get("query_related_issue_b2b__c") or case_data.get("Query_Related_Issue_B2B__c"))
+            enquiry_tag = resolve_enquiry_query_issue(enquiry_val, query_val, issue_val)
+            if enquiry_tag:
+                cf_list.append({"id": ENQUIRY_QUERY_ISSUE_FIELD_ID, "value": enquiry_tag})
+            if enquiry_val and ENQUIRY_TEXT_FIELD_ID not in cf_ids:
+                cf_list.append({"id": ENQUIRY_TEXT_FIELD_ID, "value": enquiry_val})
+            if query_val and QUERY_TEXT_FIELD_ID not in cf_ids:
+                cf_list.append({"id": QUERY_TEXT_FIELD_ID, "value": query_val})
+            if issue_val and QUERY_RELATED_ISSUE_TEXT_FIELD_ID not in cf_ids:
+                cf_list.append({"id": QUERY_RELATED_ISSUE_TEXT_FIELD_ID, "value": issue_val})
+            raw_payload["custom_fields"] = cf_list
+            t.prepared_payload_json = raw_payload
+
+        # Ensure mandatory Source field (30867599532700) is present
+        if 30867599532700 not in cf_ids:
+            case_data = cases_lookup.get(case_id, {})
+            source_val = s(case_data.get("bp_source__c") or case_data.get("BP_Source__c") or case_data.get("origin") or case_data.get("Origin")).lower()
+            source_tag_map = {
+                "chat": "chat",
+                "email": "email",
+                "phone": "phone",
+                "whatsapp": "whatsapp",
+                "feedback widget": "feedback_widget",
+                "feedback_widget": "feedback_widget",
+                "webhook": "webhook",
+                "portal": "portal__ticket_api_",
+                "web": "portal__ticket_api_",
+                "ticket-api": "portal__ticket_api_",
+                "ticket_api": "portal__ticket_api_",
+                "e-commerce": "portal__ticket_api_",
+                "outbound email": "email",
+            }
+            cf_list.append({"id": 30867599532700, "value": source_tag_map.get(source_val, "email")})
+            raw_payload["custom_fields"] = cf_list
+            t.prepared_payload_json = raw_payload
+
+        # Ensure brand_id and PRODUCT_FIELD_ID are set correctly from BP_Product__c
+        case_data = cases_lookup.get(case_id, {})
+        sf_product = s(case_data.get("bp_product__c") or case_data.get("BP_Product__c"))
+        if sf_product:
+            bp_info = resolve_brand_and_product(sf_product)
+            if bp_info:
+                if not raw_payload.get("brand_id") or raw_payload.get("brand_id") == 29179739154972:
+                    raw_payload["brand_id"] = int(bp_info["brand_id"])
+                if PRODUCT_FIELD_ID not in cf_ids:
+                    cf_list.append({"id": PRODUCT_FIELD_ID, "value": bp_info["product_value"]})
+                    raw_payload["custom_fields"] = cf_list
+                t.prepared_payload_json = raw_payload
+
         t.started_at = datetime.now(timezone.utc)
         t.status = "importing"
 

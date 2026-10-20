@@ -31,6 +31,145 @@ INTERNAL_COMMENT_FIELDS = [
 ]
 
 ASSOCIATION_TYPE_FIELD_ID = 30064365242012
+PRODUCT_FIELD_ID = 30867567540508
+
+from migration.engine.enquiry_mapper import (
+    ENQUIRY_QUERY_ISSUE_FIELD_ID,
+    ENQUIRY_TEXT_FIELD_ID,
+    QUERY_TEXT_FIELD_ID,
+    QUERY_RELATED_ISSUE_TEXT_FIELD_ID,
+    DEFAULT_ENQUIRY_TAG,
+    resolve_enquiry_query_issue,
+)
+
+BRAND_PRODUCT_MAP = {
+    "bag by the ocean": {
+        "brand_name": "BagsByTheOcean",
+        "brand_id": 30860511408796,
+        "product_value": "bag_by_the_ocean",
+    },
+    "bagsbytheocean": {
+        "brand_name": "BagsByTheOcean",
+        "brand_id": 30860511408796,
+        "product_value": "bag_by_the_ocean",
+    },
+    "bannerbuzz": {
+        "brand_name": "BannerBuzz",
+        "brand_id": 30860493207836,
+        "product_value": "bannerbuzz",
+    },
+    "best of signs": {
+        "brand_name": "BestofSigns",
+        "brand_id": 30860512498972,
+        "product_value": "best_of_signs",
+    },
+    "bestofsigns": {
+        "brand_name": "BestofSigns",
+        "brand_id": 30860512498972,
+        "product_value": "best_of_signs",
+    },
+    "circleone": {
+        "brand_name": "Circle One",
+        "brand_id": 30860548756764,
+        "product_value": "circleone",
+    },
+    "circle one": {
+        "brand_name": "Circle One",
+        "brand_id": 30860548756764,
+        "product_value": "circleone",
+    },
+    "covers & all": {
+        "brand_name": "Covers&All",
+        "brand_id": 30860551609244,
+        "product_value": "covers___all",
+    },
+    "covers&all": {
+        "brand_name": "Covers&All",
+        "brand_id": 30860551609244,
+        "product_value": "covers___all",
+    },
+    "neon earth": {
+        "brand_name": "Neon Earth",
+        "brand_id": 30860552556444,
+        "product_value": "neon_earth",
+    },
+    "patio hq": {
+        "brand_name": "PatioHQ",
+        "brand_id": 30860505949340,
+        "product_value": "patio_hq",
+    },
+    "patiohq": {
+        "brand_name": "PatioHQ",
+        "brand_id": 30860505949340,
+        "product_value": "patio_hq",
+    },
+    "tarps & all": {
+        "brand_name": "Tarps & All",
+        "brand_id": 30860556517916,
+        "product_value": "tarps___all",
+    },
+    "tarps&all": {
+        "brand_name": "Tarps & All",
+        "brand_id": 30860556517916,
+        "product_value": "tarps___all",
+    },
+    "vivyx printing": {
+        "brand_name": "Vivyx Printing",
+        "brand_id": 30860539169948,
+        "product_value": "vivyx_printing",
+    },
+    "north cape": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "north_cape",
+    },
+    "giant media": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "giant_media",
+    },
+    "marketplace": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "marketplace",
+    },
+    "contact": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "contact",
+    },
+    "partners": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "partners",
+    },
+    "reports": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "reports",
+    },
+    "social media": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "social_media",
+    },
+}
+
+
+def resolve_brand_and_product(prod_val: Any) -> Optional[Dict[str, Any]]:
+    """Resolve Salesforce BP_Product__c value to Zendesk Brand Name, Brand ID, and Product Field Value."""
+    raw = s(prod_val).strip()
+    if not raw:
+        return None
+    key = normalize_label(raw)
+    if key in BRAND_PRODUCT_MAP:
+        return BRAND_PRODUCT_MAP[key]
+    alphanumeric = re.sub(r"[^a-z0-9]", "", key)
+    for k, v in BRAND_PRODUCT_MAP.items():
+        if re.sub(r"[^a-z0-9]", "", k) == alphanumeric:
+            return v
+    return None
+
 
 
 def s(val: Any) -> str:
@@ -232,16 +371,6 @@ class DatabaseFieldMapper:
                 if "lookup" in target_type:
                     continue
                 if sf_api in {"BP_Tags__c", "Tags_B2B__c"}:
-                    continue
-                if sf_api == "BP_Product__c":
-                    continue
-                if sf_api in {
-                    "BP_Enquiry__c",
-                    "BP_Query__c",
-                    "BP_Query_B2B__c",
-                    "BP_Query_Related_Issue__c",
-                    "Query_Related_Issue_B2B__c",
-                }:
                     continue
 
                 value = case.get(sf_api)

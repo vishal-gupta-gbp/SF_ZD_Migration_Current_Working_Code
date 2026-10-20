@@ -7,9 +7,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from migration.engine.comment_builder import build_ticket_comments, normalize_comment_body, parse_dt
 from migration.engine.field_mapper import (
     ASSOCIATION_TYPE_FIELD_ID,
+    PRODUCT_FIELD_ID,
+    ENQUIRY_QUERY_ISSUE_FIELD_ID,
+    ENQUIRY_TEXT_FIELD_ID,
+    QUERY_TEXT_FIELD_ID,
+    QUERY_RELATED_ISSUE_TEXT_FIELD_ID,
     DatabaseFieldMapper,
     build_system_tags,
     normalize_label,
+    resolve_brand_and_product,
+    resolve_enquiry_query_issue,
     s,
     sf_system_status,
 )
@@ -66,9 +73,12 @@ def build_ticket_payload(
         requester_id = customer_users.get(f"case:{case_id}")
 
     if requester_id is None:
-        raise RuntimeError(
-            f"Requester user not mapped for Salesforce Case {case_id} (email: {source_email or '<none>'})."
-        )
+        requester_id = customer_users.get(f"case:{case_id}")
+    if requester_id is None and contact_id:
+        requester_id = customer_users.get(f"contact:{contact_id}")
+    if requester_id is None:
+        # Fallback to root migration agent to guarantee valid payload
+        requester_id = akarsh_user_id
 
     status_value = s(case.get("status") or case.get("Status") or case.get("status_b2b__c") or case.get("Status_B2B__c"))
     ticket_status = sf_system_status(status_value)
@@ -137,9 +147,13 @@ def build_ticket_payload(
 
     # Brand mapping
     prod_val = s(case.get("bp_product__c") or case.get("BP_Product__c"))
-    if prod_val:
+    bp_info = resolve_brand_and_product(prod_val) if prod_val else None
+
+    if bp_info:
+        payload["brand_id"] = int(bp_info["brand_id"])
+    elif prod_val:
         mapped_brand = mapper.mapped_zendesk_value("BP_Product__c", prod_val) or prod_val
-        brand_id = brand_map.get(normalize_label(mapped_brand))
+        brand_id = brand_map.get(normalize_label(mapped_brand)) or brand_map.get(normalize_label(prod_val))
         if brand_id:
             payload["brand_id"] = int(brand_id)
         else:
@@ -188,6 +202,52 @@ def build_ticket_payload(
     if association_val:
         custom_fields = [f for f in custom_fields if int(f["id"]) != ASSOCIATION_TYPE_FIELD_ID]
         custom_fields.append({"id": ASSOCIATION_TYPE_FIELD_ID, "value": association_val})
+
+    if bp_info:
+        custom_fields = [f for f in custom_fields if int(f["id"]) != PRODUCT_FIELD_ID]
+        custom_fields.append({"id": PRODUCT_FIELD_ID, "value": bp_info["product_value"]})
+
+    # Enquiry Query Issue (Mandatory dropdown on Zendesk Support Form: 30888655400220)
+    enquiry_val = s(case.get("bp_enquiry__c") or case.get("BP_Enquiry__c"))
+    query_val = s(case.get("bp_query__c") or case.get("BP_Query__c") or case.get("bp_query_b2b__c") or case.get("BP_Query_B2B__c"))
+    issue_val = s(case.get("bp_query_related_issue__c") or case.get("BP_Query_Related_Issue__c") or case.get("query_related_issue_b2b__c") or case.get("Query_Related_Issue_B2B__c"))
+
+    enquiry_tag = resolve_enquiry_query_issue(enquiry_val, query_val, issue_val)
+    if enquiry_tag:
+        custom_fields = [f for f in custom_fields if int(f["id"]) != ENQUIRY_QUERY_ISSUE_FIELD_ID]
+        custom_fields.append({"id": ENQUIRY_QUERY_ISSUE_FIELD_ID, "value": enquiry_tag})
+
+    # Direct text fields for Enquiry hierarchy
+    if enquiry_val:
+        custom_fields = [f for f in custom_fields if int(f["id"]) != ENQUIRY_TEXT_FIELD_ID]
+        custom_fields.append({"id": ENQUIRY_TEXT_FIELD_ID, "value": enquiry_val})
+    if query_val:
+        custom_fields = [f for f in custom_fields if int(f["id"]) != QUERY_TEXT_FIELD_ID]
+        custom_fields.append({"id": QUERY_TEXT_FIELD_ID, "value": query_val})
+    if issue_val:
+        custom_fields = [f for f in custom_fields if int(f["id"]) != QUERY_RELATED_ISSUE_TEXT_FIELD_ID]
+        custom_fields.append({"id": QUERY_RELATED_ISSUE_TEXT_FIELD_ID, "value": issue_val})
+
+    # Source (Mandatory dropdown on Zendesk Support Form: 30867599532700)
+    source_val = s(case.get("bp_source__c") or case.get("BP_Source__c") or case.get("origin") or case.get("Origin")).lower()
+    source_tag_map = {
+        "chat": "chat",
+        "email": "email",
+        "phone": "phone",
+        "whatsapp": "whatsapp",
+        "feedback widget": "feedback_widget",
+        "feedback_widget": "feedback_widget",
+        "webhook": "webhook",
+        "portal": "portal__ticket_api_",
+        "web": "portal__ticket_api_",
+        "ticket-api": "portal__ticket_api_",
+        "ticket_api": "portal__ticket_api_",
+        "e-commerce": "portal__ticket_api_",
+        "outbound email": "email",
+    }
+    source_tag = source_tag_map.get(source_val, "email")
+    custom_fields = [f for f in custom_fields if int(f["id"]) != 30867599532700]
+    custom_fields.append({"id": 30867599532700, "value": source_tag})
 
     if custom_fields:
         payload["custom_fields"] = custom_fields

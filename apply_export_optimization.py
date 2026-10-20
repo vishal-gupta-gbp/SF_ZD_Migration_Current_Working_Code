@@ -66,7 +66,7 @@ S3_FUNCTION = r'''def download_s3_from_export_modular(cfg: Dict[str, Any], scrip
         case_id = s(record.get("BP_Case__c"))
         case = case_by_id.get(case_id, {})
         source_url = s(record.get("BP_S3_URL__c")) or s(record.get("BP_Fallback_URL__c"))
-        migration_url = construct_migration_s3_url(source_url, target_base) if source_url else ""
+        migration_url = construct_migration_s3_url(source_url, target_base, s3_client=downloader) if source_url else ""
         comment_id, comment_source = extract_comment_id(record)
         row = {
             "Salesforce_Case_ID": case_id,

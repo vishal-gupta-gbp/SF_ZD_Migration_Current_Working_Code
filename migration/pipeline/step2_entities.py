@@ -21,10 +21,16 @@ from migration.engine.field_mapper import normalize_label, s
 from migration.engine.identity_resolver import IdentityResolver, norm, sha12, valid_email
 
 
-def run_step2_entities(settings: MigrationSettings, session: Session) -> Dict[str, Any]:
+def run_step2_entities(
+    settings: MigrationSettings,
+    session: Session,
+    ticket_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Execute Step 2: Sync Zendesk Organizations and End Users into database tables."""
     print("=" * 68)
     print("STEP 2: MIGRATE ORGANIZATIONS & END USERS (BULK OPTIMIZED & DB STORED)")
+    if ticket_ids:
+        print(f"Ticket IDs Scope: {len(ticket_ids)} specified ticket(s)")
     print("=" * 68)
 
     zd = ZendeskClient(
@@ -40,7 +46,15 @@ def run_step2_entities(settings: MigrationSettings, session: Session) -> Dict[st
     # -------------------------------------------------------------------------
     # 1. Organizations Sync
     # -------------------------------------------------------------------------
-    accounts = session.query(SFAccount).all()
+    if ticket_ids:
+        from sqlalchemy import or_
+        scoped_cases = session.query(SFCase).filter(
+            or_(SFCase.id.in_(ticket_ids), SFCase.case_number.in_(ticket_ids))
+        ).all()
+        rel_account_ids = {c.account_id for c in scoped_cases if c.account_id}
+        accounts = session.query(SFAccount).filter(SFAccount.id.in_(rel_account_ids)).all() if rel_account_ids else []
+    else:
+        accounts = session.query(SFAccount).all()
     print(f"Loaded {len(accounts):,} Salesforce Accounts from database.", flush=True)
 
     # Check already synced organizations in DB
@@ -139,9 +153,19 @@ def run_step2_entities(settings: MigrationSettings, session: Session) -> Dict[st
     # -------------------------------------------------------------------------
     # 2. End Users Discovery & Sync
     # -------------------------------------------------------------------------
-    cases = session.query(SFCase).all()
-    contacts = session.query(SFContact).all()
-    emails = session.query(SFEmailMessage).all()
+    if ticket_ids:
+        from sqlalchemy import or_
+        cases = session.query(SFCase).filter(
+            or_(SFCase.id.in_(ticket_ids), SFCase.case_number.in_(ticket_ids))
+        ).all()
+        case_con_ids = {c.contact_id for c in cases if c.contact_id}
+        contacts = session.query(SFContact).filter(SFContact.id.in_(case_con_ids)).all() if case_con_ids else []
+        case_ids_set = {c.id for c in cases}
+        emails = session.query(SFEmailMessage).filter(SFEmailMessage.parent_id.in_(case_ids_set)).all() if case_ids_set else []
+    else:
+        cases = session.query(SFCase).all()
+        contacts = session.query(SFContact).all()
+        emails = session.query(SFEmailMessage).all()
     sf_users = session.query(SFUser).all()
 
     contacts_by_id = {c.id: {"id": c.id, "name": c.name, "email": c.email, "phone": c.phone, "mobile_phone": c.mobile_phone} for c in contacts}
