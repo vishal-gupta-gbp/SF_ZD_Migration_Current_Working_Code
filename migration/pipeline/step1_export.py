@@ -498,9 +498,9 @@ def run_step1_export(
     # ---------------------------------------------------------
     files_dir = settings.workspace_dir / "attachments" / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
-    target_base = settings.s3_base_url
-
-    if s3_records and target_base:
+    if settings.skip_attachments:
+        print("Skipping S3 attachments download (skip_attachments is enabled).", flush=True)
+    elif s3_records and target_base:
         print(f"Processing {len(s3_records):,} S3 attachment records with concurrency...", flush=True)
         s3_client = S3Client(
             access_key_id=settings.aws.access_key_id,
@@ -716,9 +716,14 @@ def run_step1_export(
                 att_batch = 0
         session.commit()
 
-    total_att_success = session.query(MigrationAttachment).filter_by(download_status="success").count()
-    total_att_failed = session.query(MigrationAttachment).filter_by(download_status="failed").count()
-    print(f"S3 attachments status: {total_att_success:,} downloaded/ready, {total_att_failed:,} failed.")
+    if settings.skip_attachments:
+        total_att_success = 0
+        total_att_failed = 0
+        print("S3 attachments status: Skipped (skip_attachments is enabled).")
+    else:
+        total_att_success = session.query(MigrationAttachment).filter_by(download_status="success").count()
+        total_att_failed = session.query(MigrationAttachment).filter_by(download_status="failed").count()
+        print(f"S3 attachments status: {total_att_success:,} downloaded/ready, {total_att_failed:,} failed.")
 
     summary = {
         "cases": len(cases),
