@@ -1,0 +1,15 @@
+services:
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: migration_app
+    env_file:
+      - .env
+    environment:
+      DOCKER_CONTAINER: "1"
+    volumes:
+      - ./migration_workspace:/app/migration_workspace
+      - ./migration:/app/migration:ro
+      - ./Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:/app/Salesforce_to_Zendesk_Case_Field_Mapping.xlsx:ro
+    restart: "no"
