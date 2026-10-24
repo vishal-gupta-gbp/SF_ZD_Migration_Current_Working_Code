@@ -88,6 +88,142 @@ BATCH_SIZE = 100  # maximum ticket objects per Zendesk bulk-import request
 # Zendesk fields required by the current Salesforce -> Zendesk mapping rules.
 ASSOCIATION_TYPE_FIELD_ID = 30064365242012
 GROUP_CUSTOM_FIELD_ID = 30114110837404
+PRODUCT_FIELD_ID = 30867567540508
+ENQUIRY_QUERY_ISSUE_FIELD_ID = 30888655400220
+ENQUIRY_TEXT_FIELD_ID = 30970873867548
+QUERY_TEXT_FIELD_ID = 30970858166812
+QUERY_RELATED_ISSUE_TEXT_FIELD_ID = 30970917293852
+
+from migration.engine.enquiry_mapper import resolve_enquiry_query_issue
+
+BRAND_PRODUCT_MAP = {
+    "bag by the ocean": {
+        "brand_name": "BagsByTheOcean",
+        "brand_id": 30860511408796,
+        "product_value": "bag_by_the_ocean",
+    },
+    "bagsbytheocean": {
+        "brand_name": "BagsByTheOcean",
+        "brand_id": 30860511408796,
+        "product_value": "bag_by_the_ocean",
+    },
+    "bannerbuzz": {
+        "brand_name": "BannerBuzz",
+        "brand_id": 30860493207836,
+        "product_value": "bannerbuzz",
+    },
+    "best of signs": {
+        "brand_name": "BestofSigns",
+        "brand_id": 30860512498972,
+        "product_value": "best_of_signs",
+    },
+    "bestofsigns": {
+        "brand_name": "BestofSigns",
+        "brand_id": 30860512498972,
+        "product_value": "best_of_signs",
+    },
+    "circleone": {
+        "brand_name": "Circle One",
+        "brand_id": 30860548756764,
+        "product_value": "circleone",
+    },
+    "circle one": {
+        "brand_name": "Circle One",
+        "brand_id": 30860548756764,
+        "product_value": "circleone",
+    },
+    "covers & all": {
+        "brand_name": "Covers&All",
+        "brand_id": 30860551609244,
+        "product_value": "covers___all",
+    },
+    "covers&all": {
+        "brand_name": "Covers&All",
+        "brand_id": 30860551609244,
+        "product_value": "covers___all",
+    },
+    "neon earth": {
+        "brand_name": "Neon Earth",
+        "brand_id": 30860552556444,
+        "product_value": "neon_earth",
+    },
+    "patio hq": {
+        "brand_name": "PatioHQ",
+        "brand_id": 30860505949340,
+        "product_value": "patio_hq",
+    },
+    "patiohq": {
+        "brand_name": "PatioHQ",
+        "brand_id": 30860505949340,
+        "product_value": "patio_hq",
+    },
+    "tarps & all": {
+        "brand_name": "Tarps & All",
+        "brand_id": 30860556517916,
+        "product_value": "tarps___all",
+    },
+    "tarps&all": {
+        "brand_name": "Tarps & All",
+        "brand_id": 30860556517916,
+        "product_value": "tarps___all",
+    },
+    "vivyx printing": {
+        "brand_name": "Vivyx Printing",
+        "brand_id": 30860539169948,
+        "product_value": "vivyx_printing",
+    },
+    "north cape": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "north_cape",
+    },
+    "giant media": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "giant_media",
+    },
+    "marketplace": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "marketplace",
+    },
+    "contact": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "contact",
+    },
+    "partners": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "partners",
+    },
+    "reports": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "reports",
+    },
+    "social media": {
+        "brand_name": "Group Bayport",
+        "brand_id": 29179739154972,
+        "product_value": "social_media",
+    },
+}
+
+
+def resolve_brand_and_product(prod_val: Any) -> Optional[Dict[str, Any]]:
+    """Resolve Salesforce BP_Product__c value to Zendesk Brand Name, Brand ID, and Product Field Value."""
+    raw = s(prod_val).strip()
+    if not raw:
+        return None
+    key = normalize_label(raw)
+    if key in BRAND_PRODUCT_MAP:
+        return BRAND_PRODUCT_MAP[key]
+    alphanumeric = re.sub(r"[^a-z0-9]", "", key)
+    for k, v in BRAND_PRODUCT_MAP.items():
+        if re.sub(r"[^a-z0-9]", "", k) == alphanumeric:
+            return v
+    return None
+
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 EXPORT_ID_BATCH_SIZE = 200  # IDs per related-object SOQL query
 ZENDESK_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024
@@ -535,21 +671,31 @@ def s3_url_candidates(record: Dict[str, Any]) -> List[Tuple[str, str]]:
     return candidates
 
 
+def normalize_s3_key_slashes(key: str) -> str:
+    """Fix missing slashes after environment prefixes (e.g. 'Prod...' -> 'Prod/...')."""
+    k = str(key or "").strip().lstrip("/")
+    if k.startswith(("Prod", "prod")) and not k.startswith(("Prod/", "prod/")):
+        return f"Prod/{k[4:].lstrip('/')}"
+    if k.startswith(("UAT", "uat")) and not k.startswith(("UAT/", "uat/")):
+        return f"UAT/{k[3:].lstrip('/')}"
+    return k
+
+
 def parse_s3_url(url: str) -> Tuple[str, str]:
     """Extract bucket and object key using the proven standalone logic."""
     parsed = urlparse(url)
 
     if parsed.scheme == "s3":
-        return parsed.netloc, unquote(parsed.path.lstrip("/"))
+        return parsed.netloc, normalize_s3_key_slashes(unquote(parsed.path.lstrip("/")))
 
     netloc_parts = parsed.netloc.split(".")
 
     if netloc_parts[0] == "s3":
         path_parts = unquote(parsed.path.lstrip("/")).split("/", 1)
-        return path_parts[0], path_parts[1] if len(path_parts) > 1 else ""
+        return path_parts[0], normalize_s3_key_slashes(path_parts[1] if len(path_parts) > 1 else "")
 
     # Format: bucket.s3.region.amazonaws.com/key
-    return netloc_parts[0], unquote(parsed.path.lstrip("/"))
+    return netloc_parts[0], normalize_s3_key_slashes(unquote(parsed.path.lstrip("/")))
 
 
 def safe_local_filename(filename: str, prefix: str = "") -> str:
@@ -559,6 +705,105 @@ def safe_local_filename(filename: str, prefix: str = "") -> str:
         base = f"{prefix}_{base}"
     # Keep the Windows/local path comfortably below common path-length limits.
     return base[:180]
+
+
+def strip_s3_env_prefix(key: str) -> Tuple[str, Optional[str]]:
+    """Strip leading UAT/ or Prod/ prefixes from key, returning (clean_key, original_prefix)."""
+    k = normalize_s3_key_slashes(key)
+    original_prefix = None
+    while True:
+        matched = False
+        for prefix in ("Prod/UAT/", "UAT/Prod/", "prod/uat/", "uat/prod/"):
+            if k.startswith(prefix):
+                k = k[len(prefix):].lstrip("/")
+                matched = True
+        for prefix in ("UAT/", "Prod/", "uat/", "prod/"):
+            if k.startswith(prefix):
+                if original_prefix is None:
+                    original_prefix = prefix
+                k = k[len(prefix):].lstrip("/")
+                matched = True
+        if not matched:
+            break
+    return k, original_prefix
+
+
+def get_s3_bucket_base_url(target_base_url: str, bucket: str = "", region: str = "us-east-1") -> str:
+    """Return base bucket URL stripped of any trailing /Prod or /UAT or trailing slash."""
+    base = str(target_base_url or "").strip().rstrip("/")
+    for env_suffix in ("/Prod", "/UAT", "/prod", "/uat"):
+        if base.endswith(env_suffix):
+            base = base[:-len(env_suffix)].rstrip("/")
+    if base:
+        return base
+    if bucket:
+        return f"https://{bucket}.s3.{region}.amazonaws.com"
+    return ""
+
+
+def get_candidate_s3_keys(raw_key: str) -> list[str]:
+    """Generate candidate keys across UAT/, Prod/, and base/root folder."""
+    clean_key, orig_prefix = strip_s3_env_prefix(raw_key)
+    if not clean_key:
+        return []
+
+    clean_alt = None
+    if clean_key.startswith(("Prod", "prod")) and len(clean_key) > 4 and clean_key[4] != "/":
+        clean_alt = clean_key[4:].lstrip("/")
+    elif clean_key.startswith(("UAT", "uat")) and len(clean_key) > 3 and clean_key[3] != "/":
+        clean_alt = clean_key[3:].lstrip("/")
+
+    prefixes = ["UAT/", "Prod/", ""]
+    if orig_prefix in ("Prod/", "prod/"):
+        prefixes = ["Prod/", "UAT/", ""]
+    elif orig_prefix in ("UAT/", "uat/"):
+        prefixes = ["UAT/", "Prod/", ""]
+
+    candidates: list[str] = []
+    for p in prefixes:
+        c = f"{p}{clean_key}"
+        if c not in candidates:
+            candidates.append(c)
+        if clean_alt:
+            c2 = f"{p}{clean_alt}"
+            if c2 not in candidates:
+                candidates.append(c2)
+
+    return candidates
+
+
+_CORE_KEY_RESOLUTION_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
+
+
+def resolve_existing_s3_key(
+    client: Any,
+    bucket: str,
+    raw_key: str,
+) -> Optional[str]:
+    """Check whether the file exists in UAT folder, Prod folder, or base folder in S3."""
+    if not bucket or not raw_key:
+        return None
+
+    cache_key = (bucket, raw_key)
+    if cache_key in _CORE_KEY_RESOLUTION_CACHE:
+        return _CORE_KEY_RESOLUTION_CACHE[cache_key]
+
+    candidates = get_candidate_s3_keys(raw_key)
+    for c in candidates:
+        try:
+            client.head_object(Bucket=bucket, Key=c)
+            _CORE_KEY_RESOLUTION_CACHE[cache_key] = c
+            return c
+        except ClientError as exc:
+            err_code = str(exc.response.get("Error", {}).get("Code", ""))
+            if err_code in ("404", "NoSuchKey", "NotFound"):
+                continue
+            continue
+        except Exception:
+            continue
+
+    _CORE_KEY_RESOLUTION_CACHE[cache_key] = None
+    return None
 
 
 class S3Downloader:
@@ -581,25 +826,53 @@ class S3Downloader:
             region_name=self.region,
         )
 
+    def resolve_key(self, bucket: str, raw_key: str) -> Optional[str]:
+        return resolve_existing_s3_key(self.client, bucket, raw_key)
+
     def download(self, url: str, local_path: Path, transfer_config: Optional[TransferConfig] = None) -> Dict[str, Any]:
-        """Download a private S3 object using the proven direct boto3 call."""
+        """Download a private S3 object using the proven direct boto3 call with candidate folder resolution."""
         bucket, key = parse_s3_url(url)
         if not bucket or not key:
             raise RuntimeError(f"Invalid S3 URL: {url}")
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
+        resolved_key = self.resolve_key(bucket, key)
+        actual_key = resolved_key or key
+
         try:
             self.client.download_file(
                 Bucket=bucket,
-                Key=key,
+                Key=actual_key,
                 Filename=str(local_path),
                 Config=transfer_config,
             )
         except ClientError as exc:
-            raise RuntimeError(
-                f"S3 download failed for {url}: {exc}"
-            ) from exc
+            if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                candidates = get_candidate_s3_keys(key)
+                downloaded = False
+                for cand in candidates:
+                    if cand == actual_key:
+                        continue
+                    try:
+                        self.client.download_file(
+                            Bucket=bucket,
+                            Key=cand,
+                            Filename=str(local_path),
+                            Config=transfer_config,
+                        )
+                        if local_path.exists():
+                            actual_key = cand
+                            downloaded = True
+                            break
+                    except Exception:
+                        continue
+                if not downloaded:
+                    raise RuntimeError(f"S3 download failed for {url} (key: {actual_key}): {exc}") from exc
+            else:
+                raise RuntimeError(
+                    f"S3 download failed for {url}: {exc}"
+                ) from exc
         except (BotoCoreError, OSError) as exc:
             raise RuntimeError(
                 f"S3 download failed for {url}: {exc}"
@@ -612,7 +885,7 @@ class S3Downloader:
 
         return {
             "bucket": bucket,
-            "key": key,
+            "key": actual_key,
             "size": local_path.stat().st_size,
             "content_type": mimetypes.guess_type(local_path.name)[0] or "application/octet-stream",
             "etag": "",
@@ -1419,17 +1692,34 @@ class ZendeskClient:
 
     def import_ticket(self, ticket_payload: Dict[str, Any], archive_immediately: bool = False) -> Dict[str, Any]:
         clean_payload = strip_private_metadata(ticket_payload)
-        response = self.request(
-            "POST",
-            "/api/v2/imports/tickets.json",
-            params={"archive_immediately": str(archive_immediately).lower()},
-            json_body={"ticket": clean_payload},
-        )
-        if response.status_code != 201:
-            raise RuntimeError(
-                f"Zendesk ticket import failed: HTTP {response.status_code}\n{response.text[:5000]}"
-            )
-        return response.json().get("ticket", {})
+        last_error: Any = None
+        for attempt in range(1, 4):
+            try:
+                response = self.request(
+                    "POST",
+                    "/api/v2/imports/tickets.json",
+                    params={"archive_immediately": str(archive_immediately).lower()},
+                    json_body={"ticket": clean_payload},
+                )
+                if response.status_code == 201:
+                    return response.json().get("ticket", {})
+                last_error = RuntimeError(
+                    f"Zendesk ticket import failed: HTTP {response.status_code}\n{response.text[:5000]}"
+                )
+                if attempt < 3:
+                    print(f"  [Zendesk] Ticket import attempt {attempt} failed (HTTP {response.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(1.5)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    print(f"  [Zendesk] Ticket import attempt {attempt} exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(1.5)
+                    continue
+                raise
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise RuntimeError(f"Zendesk ticket import failed: {last_error}")
 
     def find_ticket_by_external_id(self, external_id: str) -> Optional[Dict[str, Any]]:
         query = f"type:ticket external_id:{external_id}"
@@ -1778,7 +2068,14 @@ def export_salesforce_data(
         # Inclusive end date: use the next day as the exclusive upper bound.
         next_day = parsed_end + timedelta(days=1)
         filters.append(f"CreatedDate < {next_day.isoformat()}T00:00:00Z")
-        # filters.append("BP_Case_Number_FD__c != null")
+
+    active_source_filter = os.getenv("SF_SOURCE_FILTER", "").lower().strip()
+    if active_source_filter in {"portal_api", "portal", "ticket_api", "portal_ticket_api"}:
+        print("Applying Source Filter: ONLY 'Portal (Ticket API)' cases [BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')]")
+        filters.append("BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')")
+    elif active_source_filter in {"non_portal_api", "non_portal", "exclude_portal_api"}:
+        print("Applying Source Filter: ONLY NON-'Portal (Ticket API)' cases [(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)]")
+        filters.append("(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)")
 
     where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -2088,12 +2385,6 @@ def build_custom_fields(
                 continue
             if sf_api in {"BP_Tags__c", "Tags_B2B__c"}:
                 # Store Salesforce multi-select tags as Zendesk system ticket tags.
-                continue
-            if sf_api == "BP_Product__c":
-                # Salesforce Product maps to Zendesk Brand, not the Zendesk Product custom field.
-                continue
-            if sf_api in {"BP_Enquiry__c", "BP_Query__c", "BP_Query_B2B__c", "BP_Query_Related_Issue__c", "Query_Related_Issue_B2B__c"}:
-                # These three values are stored as ticket tags per the migration requirement.
                 continue
 
             value = case.get(sf_api)
@@ -2519,10 +2810,11 @@ def build_ticket_payload(
     if requester_id is None and valid_email(source_email):
         requester_id = customer_users.get(sha12(norm(customer_email)))
     if requester_id is None:
-        raise RuntimeError(
-            f"Requester user not mapped for Salesforce Case {case_id}. "
-            f"Source customer email: {source_email or '<none>'}; phone: {phone or '<none>'}"
-        )
+        requester_id = customer_users.get(f"case:{case_id}")
+    if requester_id is None and contact:
+        requester_id = customer_users.get(f"contact:{contact.get('Id')}")
+    if requester_id is None:
+        requester_id = akarsh_user_id
 
     status_value = s(case.get("Status")) or s(case.get("Status_B2B__c"))
     ticket_status = sf_system_status(status_value) or "open"
@@ -2609,9 +2901,12 @@ def build_ticket_payload(
                 "source_value": group_value,
             })
 
-    # Salesforce Product -> Zendesk Brand.
+    # Salesforce Product -> Zendesk Brand and Product custom field.
     product_value = s(case.get("BP_Product__c"))
-    if product_value:
+    bp_info = resolve_brand_and_product(product_value) if product_value else None
+    if bp_info:
+        payload["brand_id"] = int(bp_info["brand_id"])
+    elif product_value:
         mapped_brand_name = mapped_zendesk_value(mapping, "BP_Product__c", product_value) or product_value
         brand_key = normalize_label(mapped_brand_name)
         if brand_key in brand_map:
@@ -2725,6 +3020,49 @@ def build_ticket_payload(
     if association_value:
         custom_fields = [x for x in custom_fields if int(x["id"]) != ASSOCIATION_TYPE_FIELD_ID]
         custom_fields.append({"id": ASSOCIATION_TYPE_FIELD_ID, "value": association_value})
+
+    if bp_info:
+        custom_fields = [x for x in custom_fields if int(x["id"]) != PRODUCT_FIELD_ID]
+        custom_fields.append({"id": PRODUCT_FIELD_ID, "value": bp_info["product_value"]})
+
+    # Enquiry Query Issue (Mandatory dropdown on Zendesk Support Form: 30888655400220)
+    enquiry_val = s(case.get("BP_Enquiry__c") or case.get("bp_enquiry__c"))
+    query_val = s(case.get("BP_Query__c") or case.get("bp_query__c") or case.get("BP_Query_B2B__c") or case.get("bp_query_b2b__c"))
+    issue_val = s(case.get("BP_Query_Related_Issue__c") or case.get("bp_query_related_issue__c") or case.get("Query_Related_Issue_B2B__c") or case.get("query_related_issue_b2b__c"))
+
+    enquiry_tag = resolve_enquiry_query_issue(enquiry_val, query_val, issue_val)
+    if enquiry_tag:
+        custom_fields = [x for x in custom_fields if int(x["id"]) != ENQUIRY_QUERY_ISSUE_FIELD_ID]
+        custom_fields.append({"id": ENQUIRY_QUERY_ISSUE_FIELD_ID, "value": enquiry_tag})
+
+    if enquiry_val:
+        custom_fields = [x for x in custom_fields if int(x["id"]) != ENQUIRY_TEXT_FIELD_ID]
+        custom_fields.append({"id": ENQUIRY_TEXT_FIELD_ID, "value": enquiry_val})
+    if query_val:
+        custom_fields = [x for x in custom_fields if int(x["id"]) != QUERY_TEXT_FIELD_ID]
+        custom_fields.append({"id": QUERY_TEXT_FIELD_ID, "value": query_val})
+    if issue_val:
+        custom_fields = [x for x in custom_fields if int(x["id"]) != QUERY_RELATED_ISSUE_TEXT_FIELD_ID]
+        custom_fields.append({"id": QUERY_RELATED_ISSUE_TEXT_FIELD_ID, "value": issue_val})
+
+    source_val = s(case.get("BP_Source__c") or case.get("bp_source__c") or case.get("Origin") or case.get("origin")).lower()
+    source_tag_map = {
+        "chat": "chat",
+        "email": "email",
+        "phone": "phone",
+        "whatsapp": "whatsapp",
+        "feedback widget": "feedback_widget",
+        "feedback_widget": "feedback_widget",
+        "webhook": "webhook",
+        "portal": "portal__ticket_api_",
+        "web": "portal__ticket_api_",
+        "ticket-api": "portal__ticket_api_",
+        "ticket_api": "portal__ticket_api_",
+        "e-commerce": "portal__ticket_api_",
+        "outbound email": "email",
+    }
+    custom_fields = [x for x in custom_fields if int(x["id"]) != 30867599532700]
+    custom_fields.append({"id": 30867599532700, "value": source_tag_map.get(source_val, "email")})
 
     if custom_fields:
         payload["custom_fields"] = custom_fields
@@ -3104,8 +3442,18 @@ def execute_migration(
             group_map[normalize_label(lookup_name)] = int(zd_group["id"])
 
     brand_map: Dict[str, int] = {}
+    for k, v in BRAND_PRODUCT_MAP.items():
+        brand_map[normalize_label(k)] = int(v["brand_id"])
+        brand_map[normalize_label(v["brand_name"])] = int(v["brand_id"])
+
     product_values = sorted({s(c.get("BP_Product__c")) for c in cases if s(c.get("BP_Product__c"))})
     for product_value in product_values:
+        if normalize_label(product_value) in brand_map:
+            continue
+        bp_info = resolve_brand_and_product(product_value)
+        if bp_info:
+            brand_map[normalize_label(product_value)] = int(bp_info["brand_id"])
+            continue
         lookup_name = mapped_zendesk_value(mapping, "BP_Product__c", product_value) or product_value
         zd_brand = zd.find_brand_by_name(lookup_name)
         if zd_brand and zd_brand.get("id"):
@@ -3368,42 +3716,43 @@ def s3_target_base_url(cfg: Dict[str, Any]) -> str:
     return s(os.getenv("S3_BASE_URL")) or s(s3_cfg.get("base_url")) or s(s3_cfg.get("target_base_url"))
 
 
-def construct_migration_s3_url(raw_url: str, target_base_url: str) -> str:
-    """Resolve S3 references using config; never rewrite a complete URL."""
-    raw = s(raw_url)
-    base = s(target_base_url)
+def construct_migration_s3_url(raw_url: str, target_base_url: str, s3_client: Optional[Any] = None) -> str:
+    """Normalize source S3 URL by checking existence in UAT, Prod, or base folder.
+
+    Prevents duplicate '/Prod/UAT' or '/UAT/Prod' segments.
+    """
+    raw = str(raw_url or "").strip()
     if not raw:
         return ""
 
-    parsed = urlparse(raw)
-    scheme = parsed.scheme.lower()
-
-    if scheme in {"http", "https"} and parsed.netloc:
-        if "/Prod" in parsed.path and "/Prod/" not in parsed.path:
-            return raw.replace("/Prod", "/Prod/", 1)
-        return raw
-
-    parsed = urlparse(raw)
-    scheme = parsed.scheme.lower()
-
-    # A complete HTTP(S) URL from Salesforce is authoritative and is preserved.
-    if scheme in {"http", "https"} and parsed.netloc:
-        return raw
-
-    # Native s3://bucket/key references are converted only when a configured
-    # HTTPS base URL is available. Otherwise the native reference is retained.
-    if scheme == "s3" and parsed.netloc:
-        if not base:
-            return raw
-        key = unquote(parsed.path.lstrip("/"))
-    else:
-        if not base:
-            raise RuntimeError("S3 base_url is not configured and Salesforce did not provide a complete URL.")
-        key = raw.lstrip("/")
+    bucket, key = parse_s3_url(raw)
+    clean_base = get_s3_bucket_base_url(target_base_url, bucket=bucket)
 
     if not key:
         return raw
-    return f"{base.rstrip('/')}/{quote(key, safe='/-_.~()')}"
+
+    clean_key, orig_prefix = strip_s3_env_prefix(key)
+
+    resolved_key = None
+    if s3_client is not None:
+        client_obj = getattr(s3_client, "client", s3_client)
+        if hasattr(client_obj, "head_object"):
+            resolved_key = resolve_existing_s3_key(client_obj, bucket, key)
+
+    if resolved_key:
+        final_key = resolved_key
+    elif orig_prefix:
+        final_key = f"{orig_prefix.rstrip('/')}/{clean_key}"
+    elif target_base_url and any(target_base_url.rstrip("/").endswith(p) for p in ("/Prod", "/prod")):
+        final_key = f"Prod/{clean_key}"
+    elif target_base_url and any(target_base_url.rstrip("/").endswith(p) for p in ("/UAT", "/uat")):
+        final_key = f"UAT/{clean_key}"
+    else:
+        final_key = clean_key
+
+    if clean_base:
+        return f"{clean_base}/{final_key}"
+    return final_key
 
 
 def modular_max_tickets(cfg: Dict[str, Any], override: Optional[int] = None) -> int:
@@ -3458,7 +3807,7 @@ def download_s3_from_export_modular(cfg: Dict[str, Any], script_dir: Path) -> Di
         case_id = s(record.get("BP_Case__c"))
         case = case_by_id.get(case_id, {})
         source_url = s(record.get("BP_S3_URL__c")) or s(record.get("BP_Fallback_URL__c"))
-        migration_url = construct_migration_s3_url(source_url, target_base) if source_url else ""
+        migration_url = construct_migration_s3_url(source_url, target_base, s3_client=downloader) if source_url else ""
         comment_id, comment_source = extract_comment_id(record)
         row = {
             "Salesforce_Case_ID": case_id,
@@ -4278,22 +4627,43 @@ def _submit_bulk_ticket_import_job(
 ) -> Dict[str, Any]:
     """Submit up to 100 ticket payloads and wait for Zendesk's asynchronous import job."""
     body = {"tickets": [item["api_payload"] for item in batch_items]}
-    response = zd.request(
-        "POST",
-        "/api/v2/imports/tickets/create_many.json",
-        params={"archive_immediately": str(archive_immediately).lower()},
-        json_body=body,
-    )
-    if response.status_code not in {200, 201, 202}:
-        raise _BulkTicketRequestError(response.status_code, response.text[:5000])
+    last_error: Any = None
+    job: Dict[str, Any] = {}
+    for attempt in range(1, 4):
+        try:
+            response = zd.request(
+                "POST",
+                "/api/v2/imports/tickets/create_many.json",
+                params={"archive_immediately": str(archive_immediately).lower()},
+                json_body=body,
+            )
+            if response.status_code not in {200, 201, 202}:
+                last_error = _BulkTicketRequestError(response.status_code, response.text[:5000])
+                if attempt < 3:
+                    print(f"  [Zendesk] Bulk ticket import job attempt {attempt} failed (HTTP {response.status_code}). Retrying ({attempt}/2)...", flush=True)
+                    time.sleep(2)
+                    continue
+                raise last_error
 
-    try:
-        data = response.json()
-    except Exception as exc:
-        raise RuntimeError(f"Zendesk bulk ticket import returned invalid JSON: {response.text[:2000]}") from exc
-    job = data.get("job_status", data) if isinstance(data, dict) else {}
-    if not isinstance(job, dict) or not (job.get("id") or job.get("url")):
-        raise RuntimeError(f"Zendesk bulk ticket import did not return a job status: {str(data)[:2000]}")
+            data = response.json()
+            job = data.get("job_status", data) if isinstance(data, dict) else {}
+            if isinstance(job, dict) and (job.get("id") or job.get("url")):
+                break
+            last_error = RuntimeError(f"Zendesk bulk ticket import did not return a job status: {str(data)[:2000]}")
+            if attempt < 3:
+                time.sleep(2)
+                continue
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                print(f"  [Zendesk] Bulk ticket import job exception ({exc}). Retrying ({attempt}/2)...", flush=True)
+                time.sleep(2)
+                continue
+            raise
+    else:
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise RuntimeError(f"Zendesk bulk ticket import failed: {last_error}")
 
     job_id = s(job.get("id"))
     job_url = s(job.get("url"))
@@ -4652,6 +5022,13 @@ def import_prepared_tickets_modular(
         existing_status = False
         if not existing_id:
             existing = zd.find_ticket_by_external_id(case_id)
+            if not existing and case_number:
+                # Also check Zendesk by case_number to detect duplicates migrated earlier
+                q_num = zd.request("GET", "/api/v2/search.json", params={"query": f'type:ticket "{case_number}"', "per_page": 5})
+                if q_num.status_code == 200:
+                    res_items = q_num.json().get("results", [])
+                    if res_items:
+                        existing = res_items[0]
             if existing and existing.get("id"):
                 existing_id = int(existing["id"])
                 existing_status = True

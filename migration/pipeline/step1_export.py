@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy.orm import Session
 
-from migration.clients.s3 import S3Client, construct_migration_s3_url, parse_s3_url
+from migration.clients.s3 import S3Client, construct_migration_s3_url, get_s3_bucket_base_url, parse_s3_url
 from migration.clients.salesforce import SalesforceClient, chunks, quote_soql, soql_ids
 from migration.config import MigrationSettings
 from migration.db.models import (
@@ -106,6 +106,8 @@ def run_step1_export(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     max_tickets: Optional[int] = None,
+    source_filter: Optional[str] = None,
+    ticket_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute Step 1: Export Salesforce data and download attachments into database."""
     print("=" * 68)
@@ -113,6 +115,7 @@ def run_step1_export(
     print("=" * 68)
 
     limit_val = max_tickets if max_tickets is not None else settings.max_tickets
+    active_source_filter = (source_filter or settings.source_filter or "all").lower().strip()
     sf = SalesforceClient(
         base_url=settings.salesforce.base_url,
         client_id=settings.salesforce.consumer_key,
@@ -123,8 +126,15 @@ def run_step1_export(
     sf.authenticate()
     print("Salesforce authentication successful.")
 
-    # Build date filters
+    # Build date, ticket_ids & source filters
     filters: List[str] = []
+    if ticket_ids:
+        clean_ids = [quote_soql(tid.strip()) for tid in ticket_ids if tid.strip()]
+        if clean_ids:
+            in_clause = ", ".join(f"'{x}'" for x in clean_ids)
+            filters.append(f"(Id IN ({in_clause}) OR CaseNumber IN ({in_clause}))")
+            print(f"Applying Ticket IDs Filter: {len(clean_ids)} specified ticket ID(s)")
+
     if start_date:
         parsed_start = datetime.strptime(start_date, "%Y-%m-%d").date()
         filters.append(f"CreatedDate >= {start_date}T00:00:00Z")
@@ -132,6 +142,15 @@ def run_step1_export(
         parsed_end = datetime.strptime(end_date, "%Y-%m-%d").date()
         next_day = parsed_end + timedelta(days=1)
         filters.append(f"CreatedDate < {next_day.isoformat()}T00:00:00Z")
+
+    if active_source_filter in {"portal_api", "portal", "ticket_api", "portal_ticket_api"}:
+        print("Applying Source Filter: ONLY 'Portal (Ticket API)' cases [BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')]")
+        filters.append("BP_Source__c IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API')")
+    elif active_source_filter in {"non_portal_api", "non_portal", "exclude_portal_api"}:
+        print("Applying Source Filter: ONLY NON-'Portal (Ticket API)' cases [(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)]")
+        filters.append("(BP_Source__c NOT IN ('Ticket-API', 'Portal (Ticket API)', 'Ticket API') OR BP_Source__c = null)")
+    else:
+        print(f"Source Filter: ALL sources (no BP_Source__c filter applied)")
 
     where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
     fields = build_case_select_fields(sf, session)
@@ -500,7 +519,7 @@ def run_step1_export(
             source_url = s(s3r.get("BP_S3_URL__c")) or s(s3r.get("BP_Fallback_URL__c"))
             if not source_url:
                 continue
-            migration_url = construct_migration_s3_url(source_url, target_base)
+            migration_url = construct_migration_s3_url(source_url, target_base, s3_client=s3_client)
             if not migration_url:
                 continue
 
@@ -541,6 +560,37 @@ def run_step1_export(
                     "error": "",
                 }
             except Exception as exc:
+                fallback_url = s(record.get("BP_Fallback_URL__c"))
+                if fallback_url and fallback_url != url:
+                    try:
+                        import requests
+                        resp = requests.get(fallback_url, timeout=30, stream=True)
+                        if resp.status_code == 200:
+                            local_path.parent.mkdir(parents=True, exist_ok=True)
+                            hasher = hashlib.sha256()
+                            with open(local_path, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                    f.write(chunk)
+                                    hasher.update(chunk)
+                            file_size = local_path.stat().st_size
+                            mime = mimetypes.guess_type(local_path.name)[0] or resp.headers.get("content-type") or "application/octet-stream"
+                            return {
+                                "url": url,
+                                "case_id": case_id,
+                                "record_id": s(record.get("Id")),
+                                "local_file_path": str(local_path.relative_to(settings.workspace_dir)),
+                                "file_name": name,
+                                "bucket": parse_s3_url(url)[0] or "gbp-sf-jira-integration",
+                                "key": parse_s3_url(url)[1],
+                                "size": file_size,
+                                "content_type": mime,
+                                "sha256": hasher.hexdigest(),
+                                "status": "success",
+                                "error": "",
+                            }
+                    except Exception:
+                        pass
+
                 return {
                     "url": url,
                     "case_id": case_id,
@@ -565,17 +615,21 @@ def run_step1_export(
                     download_results[res["url"]] = res
 
         # Insert or update MigrationAttachment records in DB
-        existing_s3_att_ids = {
-            r[0]
-            for r in session.query(MigrationAttachment.s3_record_id).filter(MigrationAttachment.s3_record_id.isnot(None)).all()
+        existing_att_map = {
+            a.s3_record_id: a
+            for a in session.query(MigrationAttachment).filter(MigrationAttachment.s3_record_id.isnot(None)).all()
         }
         att_batch = 0
         for s3r in s3_records:
             s3_rec_id = s(s3r.get("Id"))
-            if not s3_rec_id or s3_rec_id in existing_s3_att_ids:
+            if not s3_rec_id:
                 continue
+            existing_att = existing_att_map.get(s3_rec_id)
+            if existing_att and existing_att.download_status == "success":
+                continue
+
             source_url = s(s3r.get("BP_S3_URL__c")) or s(s3r.get("BP_Fallback_URL__c"))
-            migration_url = construct_migration_s3_url(source_url, target_base) if source_url else ""
+            migration_url = construct_migration_s3_url(source_url, target_base, s3_client=s3_client) if source_url else ""
             comment_id, _ = extract_comment_id(s3r)
             case_id = s(s3r.get("BP_Case__c"))
 
@@ -583,46 +637,78 @@ def run_step1_export(
             prior = existing_attachments.get(migration_url)
 
             if res:
-                att = MigrationAttachment(
-                    case_id=case_id,
-                    comment_id=comment_id,
-                    s3_record_id=s3_rec_id,
-                    file_name=res["file_name"],
-                    original_s3_url=source_url,
-                    migration_s3_url=migration_url,
-                    local_file_path=res["local_file_path"],
-                    bucket=res["bucket"],
-                    key=res["key"],
-                    file_size_bytes=res["size"],
-                    content_type=res["content_type"],
-                    sha256=res["sha256"],
-                    download_status=res["status"],
-                    download_error=res["error"],
-                    upload_status="pending",
-                )
-                session.add(att)
-                existing_s3_att_ids.add(s3_rec_id)
-                att_batch += 1
-            elif prior:
-                session.add(
-                    MigrationAttachment(
+                actual_key = res.get("key")
+                actual_bucket = res.get("bucket")
+                if actual_key and actual_bucket:
+                    bucket_base = get_s3_bucket_base_url(target_base, bucket=actual_bucket)
+                    if bucket_base:
+                        migration_url = f"{bucket_base}/{actual_key}"
+
+                if existing_att:
+                    existing_att.file_name = res["file_name"]
+                    existing_att.original_s3_url = source_url
+                    existing_att.migration_s3_url = migration_url
+                    existing_att.local_file_path = res["local_file_path"]
+                    existing_att.bucket = res["bucket"]
+                    existing_att.key = res["key"]
+                    existing_att.file_size_bytes = res["size"]
+                    existing_att.content_type = res["content_type"]
+                    existing_att.sha256 = res["sha256"]
+                    existing_att.download_status = res["status"]
+                    existing_att.download_error = res["error"]
+                else:
+                    att = MigrationAttachment(
                         case_id=case_id,
                         comment_id=comment_id,
                         s3_record_id=s3_rec_id,
-                        file_name=prior.file_name,
+                        file_name=res["file_name"],
                         original_s3_url=source_url,
                         migration_s3_url=migration_url,
-                        local_file_path=prior.local_file_path,
-                        bucket=prior.bucket,
-                        key=prior.key,
-                        file_size_bytes=prior.file_size_bytes,
-                        content_type=prior.content_type,
-                        sha256=prior.sha256,
-                        download_status="success",
+                        local_file_path=res["local_file_path"],
+                        bucket=res["bucket"],
+                        key=res["key"],
+                        file_size_bytes=res["size"],
+                        content_type=res["content_type"],
+                        sha256=res["sha256"],
+                        download_status=res["status"],
+                        download_error=res["error"],
                         upload_status="pending",
                     )
-                )
-                existing_s3_att_ids.add(s3_rec_id)
+                    session.add(att)
+                    existing_att_map[s3_rec_id] = att
+                att_batch += 1
+            elif prior:
+                if existing_att:
+                    existing_att.file_name = prior.file_name
+                    existing_att.original_s3_url = source_url
+                    existing_att.migration_s3_url = migration_url
+                    existing_att.local_file_path = prior.local_file_path
+                    existing_att.bucket = prior.bucket
+                    existing_att.key = prior.key
+                    existing_att.file_size_bytes = prior.file_size_bytes
+                    existing_att.content_type = prior.content_type
+                    existing_att.sha256 = prior.sha256
+                    existing_att.download_status = "success"
+                else:
+                    session.add(
+                        MigrationAttachment(
+                            case_id=case_id,
+                            comment_id=comment_id,
+                            s3_record_id=s3_rec_id,
+                            file_name=prior.file_name,
+                            original_s3_url=source_url,
+                            migration_s3_url=migration_url,
+                            local_file_path=prior.local_file_path,
+                            bucket=prior.bucket,
+                            key=prior.key,
+                            file_size_bytes=prior.file_size_bytes,
+                            content_type=prior.content_type,
+                            sha256=prior.sha256,
+                            download_status="success",
+                            upload_status="pending",
+                        )
+                    )
+                    existing_att_map[s3_rec_id] = prior
                 att_batch += 1
 
             if att_batch >= 500:

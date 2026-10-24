@@ -21,18 +21,24 @@ from migration.pipeline.step4_import import run_step4_import
 
 def run_full_migration(
     settings: MigrationSettings,
-    start_date: str,
-    end_date: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     max_tickets: Optional[int] = None,
     archive_immediately: Optional[bool] = None,
+    source_filter: Optional[str] = None,
+    ticket_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute the complete end-to-end migration pipeline."""
     limit_val = max_tickets if max_tickets is not None else settings.max_tickets
+    active_source = (source_filter or settings.source_filter or "all").lower().strip()
 
     print("=" * 70)
     print("SALESFORCE -> ZENDESK DATABASE-BACKED MIGRATION PIPELINE")
     print("=" * 70)
-    print(f"Date Range    : {start_date} -> {end_date} (inclusive)")
+    if ticket_ids:
+        print(f"Ticket IDs    : {len(ticket_ids)} specified ticket(s)")
+    if start_date or end_date:
+        print(f"Date Range    : {start_date or 'ALL'} -> {end_date or 'ALL'} (inclusive)")
     print(f"Max Tickets   : {'ALL' if limit_val == 0 else limit_val}")
     print(f"Database URL  : {settings.database_url.split('@')[-1] if '@' in settings.database_url else settings.database_url}")
     print("=" * 70)
@@ -52,8 +58,8 @@ def run_full_migration(
 
         # Create MigrationRun
         run = MigrationRun(
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_date or "",
+            end_date=end_date or "",
             max_tickets=limit_val,
             status="in_progress",
         )
@@ -70,12 +76,14 @@ def run_full_migration(
                 start_date=start_date,
                 end_date=end_date,
                 max_tickets=limit_val,
+                source_filter=active_source,
+                ticket_ids=ticket_ids,
             )
             summary["step1_export"] = s1
 
         # STEP 2: Entities
         with get_db() as session:
-            s2 = run_step2_entities(settings=settings, session=session)
+            s2 = run_step2_entities(settings=settings, session=session, ticket_ids=ticket_ids)
             summary["step2_entities"] = s2
 
         # STEP 3: Prepare
@@ -86,6 +94,7 @@ def run_full_migration(
                 start_date=start_date,
                 end_date=end_date,
                 max_tickets=limit_val,
+                ticket_ids=ticket_ids,
             )
             summary["step3_prepare"] = s3
 
@@ -98,6 +107,7 @@ def run_full_migration(
                 archive_immediately=archive_immediately,
                 start_date=start_date,
                 end_date=end_date,
+                ticket_ids=ticket_ids,
             )
             summary["step4_import_standard"] = s4
 
@@ -110,6 +120,7 @@ def run_full_migration(
                 archive_immediately=archive_immediately,
                 start_date=start_date,
                 end_date=end_date,
+                ticket_ids=ticket_ids,
             )
             summary["step5_import_phone"] = s5
 
