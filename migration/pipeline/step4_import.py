@@ -138,15 +138,20 @@ def run_step4_import(
     print(f"Found {len(tickets):,} candidate tickets in database for {label}.", flush=True)
 
     # Pre-index attachments by case_id from DB
-    attachments = session.query(MigrationAttachment).all()
     attachments_by_case: Dict[str, List[MigrationAttachment]] = {}
-    for att in attachments:
-        attachments_by_case.setdefault(att.case_id, []).append(att)
+    if not settings.skip_attachments:
+        attachments = session.query(MigrationAttachment).all()
+        for att in attachments:
+            attachments_by_case.setdefault(att.case_id, []).append(att)
+    else:
+        print(f"[Import] Skipping attachment uploads to Zendesk (skip_attachments is enabled).", flush=True)
 
     bulk_enabled = True
     batch_size = settings.zd_bulk_import_batch_size
 
     def upload_attachment(att: MigrationAttachment) -> Optional[str]:
+        if settings.skip_attachments:
+            return None
         if att.upload_token and att.upload_status == "success":
             return att.upload_token
 
@@ -173,6 +178,8 @@ def run_step4_import(
                 return None
 
     def link_attachments_to_payload(case_id: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int, int]:
+        if settings.skip_attachments:
+            return payload, 0, 0
         case_atts = attachments_by_case.get(case_id, [])
         if not case_atts:
             return payload, 0, 0

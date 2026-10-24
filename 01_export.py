@@ -35,6 +35,7 @@ def main():
         choices=["all", "portal_api", "non_portal_api"],
         help="Filter Salesforce cases by BP_Source__c ('portal_api' for Portal (Ticket API), 'non_portal_api', or 'all')",
     )
+    p.add_argument("--skip-attachments", action="store_true", help="Skip S3 file downloads")
     a = p.parse_args()
 
     ticket_ids = parse_ticket_ids(a.ticket_ids)
@@ -47,6 +48,8 @@ def main():
         settings.database_url = a.db_url
     if a.source_filter:
         settings.source_filter = a.source_filter.lower().strip()
+    if a.skip_attachments:
+        settings.skip_attachments = True
 
     engine = init_engine(settings.database_url)
     init_db(engine)

@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--config", default=None, help="Optional path to config JSON file")
     shared.add_argument("--db-url", default=None, help="Override DATABASE_URL")
+    shared.add_argument("--skip-attachments", action="store_true", help="Skip S3 file downloads and Zendesk attachment transfers")
 
     parser = argparse.ArgumentParser(
         prog="migration",
@@ -120,6 +121,8 @@ def main(args: Optional[list] = None) -> int:
         settings.database_url = parsed.db_url
     if getattr(parsed, "source_filter", None):
         settings.source_filter = parsed.source_filter.lower().strip()
+    if getattr(parsed, "skip_attachments", False):
+        settings.skip_attachments = True
 
     ticket_ids = parse_ticket_ids(getattr(parsed, "ticket_ids", None))
 

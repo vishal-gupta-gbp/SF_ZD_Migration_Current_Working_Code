@@ -78,6 +78,9 @@ class MigrationSettings:
     # Source filtering: 'all', 'portal_api', 'non_portal_api'
     source_filter: str = "all"
 
+    # Attachment skipping: skip S3 downloads and Zendesk uploads
+    skip_attachments: bool = False
+
 
 def load_config(config_path: Optional[Path | str] = None) -> MigrationSettings:
     """Load configuration from environment variables (with optional JSON file overrides)."""
@@ -161,4 +164,5 @@ def load_config(config_path: Optional[Path | str] = None) -> MigrationSettings:
         zd_upload_concurrency=int(os.getenv("ZD_UPLOAD_CONCURRENCY", 5)),
         zd_bulk_import_batch_size=int(os.getenv("ZD_BULK_IMPORT_BATCH_SIZE", 100)),
         source_filter=os.getenv("SF_SOURCE_FILTER", cfg_data.get("source_filter", "all")).lower().strip(),
+        skip_attachments=os.getenv("SKIP_ATTACHMENTS", "").lower() in {"true", "1", "yes"} or bool(cfg_data.get("skip_attachments", False)),
     )

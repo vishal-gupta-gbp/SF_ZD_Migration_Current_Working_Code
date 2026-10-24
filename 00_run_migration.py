@@ -32,6 +32,7 @@ def parse_args():
         choices=["all", "portal_api", "non_portal_api"],
         help="Filter Salesforce cases by BP_Source__c ('portal_api' for Portal (Ticket API), 'non_portal_api', or 'all')",
     )
+    p.add_argument("--skip-attachments", action="store_true", help="Skip S3 file downloads and Zendesk attachment transfers")
     return p.parse_args()
 
 
@@ -50,6 +51,8 @@ def main():
         settings.database_url = args.db_url
     if args.source_filter:
         settings.source_filter = args.source_filter.lower().strip()
+    if args.skip_attachments:
+        settings.skip_attachments = True
 
     ticket_ids = parse_ticket_ids(args.ticket_ids)
     if not args.start_date and not ticket_ids:

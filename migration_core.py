@@ -3777,6 +3777,10 @@ def download_s3_from_export_modular(cfg: Dict[str, Any], script_dir: Path) -> Di
     case_by_id = {s(c.get("Id")): c for c in cases if s(c.get("Id"))}
     records = [r for r in records if s(r.get("BP_Case__c")) in case_by_id]
 
+    if os.getenv("SKIP_ATTACHMENTS", "").lower() in {"true", "1", "yes"} or cfg.get("skip_attachments"):
+        print("[S3] Skipping S3 attachment downloads (SKIP_ATTACHMENTS is enabled).", flush=True)
+        return {"records": len(records), "download_success": 0, "download_failed": 0, "manifest_csv": "", "manifest_xlsx": ""}
+
     access, secret, region = get_aws_config(cfg)
     downloader = S3Downloader(access, secret, region)
     target_base = s3_target_base_url(cfg)
@@ -4172,6 +4176,8 @@ def _runtime_attach_files_to_payload(
     workspace: Path, migration_report_rows: List[Dict[str, Any]],
 ) -> None:
     """Upload each file immediately before ticket creation. No token is persisted for later use."""
+    if os.getenv("SKIP_ATTACHMENTS", "").lower() in {"true", "1", "yes"}:
+        return
     if not case_rows:
         return
     comments = payload.setdefault("comments", [])

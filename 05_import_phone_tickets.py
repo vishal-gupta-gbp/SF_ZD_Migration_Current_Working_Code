@@ -28,6 +28,7 @@ def main():
     p.add_argument("--end-date", default=None, help="YYYY-MM-DD")
     p.add_argument("--ticket-ids", "--case-ids", "--sf-ticket-ids", default=None, help="Comma-separated Salesforce Case IDs or Case Numbers")
     p.add_argument("--db-url", default=None, help="Override database URL")
+    p.add_argument("--skip-attachments", action="store_true", help="Skip Zendesk attachment transfers")
     a = p.parse_args()
 
     ticket_ids = parse_ticket_ids(a.ticket_ids)
@@ -35,6 +36,8 @@ def main():
     settings = load_config(a.config)
     if a.db_url:
         settings.database_url = a.db_url
+    if a.skip_attachments:
+        settings.skip_attachments = True
 
     engine = init_engine(settings.database_url)
     init_db(engine)

@@ -57,6 +57,10 @@ docker compose run --rm migration run --start-date 2026-09-01 --end-date 2026-09
 
 # Full migration (all cases in range)
 docker compose run --rm migration run --start-date 2026-09-01 --end-date 2026-09-30 --max-tickets 0
+
+# Skip S3 downloads and Zendesk attachment transfers (tickets only)
+docker compose run --rm migration run --start-date 2026-09-01 --end-date 2026-09-30 --skip-attachments
+# (Or set SKIP_ATTACHMENTS=true in .env)
 ```
 
 ### 5. Export Reconciliation Reports
