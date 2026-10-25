@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -498,8 +499,11 @@ def run_step1_export(
     # ---------------------------------------------------------
     files_dir = settings.workspace_dir / "attachments" / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
+    target_base = (settings.s3_base_url or os.getenv("S3_BASE_URL", "")).strip()
     if settings.skip_attachments:
         print("Skipping S3 attachments download (skip_attachments is enabled).", flush=True)
+    elif s3_records and not target_base:
+        print("Warning: S3 attachment records found, but S3_BASE_URL is not set. Skipping S3 attachment download.", flush=True)
     elif s3_records and target_base:
         print(f"Processing {len(s3_records):,} S3 attachment records with concurrency...", flush=True)
         s3_client = S3Client(
