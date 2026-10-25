@@ -14,7 +14,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-migration_user} -d ${POSTGRES_DB:-migration_db}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-migration_user} -d ${POSTGRES_DB:-migration_db}" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -34,7 +34,7 @@ services:
     env_file:
       - .env
     environment:
-     # DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-migration_user}:${POSTGRES_PASSWORD:-migration_pass}@postgres:5432/${POSTGRES_DB:-migration_db}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-migration_user}:${POSTGRES_PASSWORD:-migration_pass}@postgres:5432/${POSTGRES_DB:-migration_db}
       DOCKER_CONTAINER: "1"
     volumes:
       - ./migration_workspace:/app/migration_workspace

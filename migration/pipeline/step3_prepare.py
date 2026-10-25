@@ -181,44 +181,6 @@ def run_step3_prepare(
     record_types = session.query(SFRecordType).all()
     record_types_by_id = {rt.id: {"id": rt.id, "name": rt.name} for rt in record_types}
 
-    # Group email messages, s3 records, tasks
-    email_messages = session.query(SFEmailMessage).all()
-    emails_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for em in email_messages:
-        emails_by_case[em.parent_id].append(em.raw_data_json or {
-            "id": em.id,
-            "created_date": em.created_date,
-            "message_date": em.message_date,
-            "incoming": em.incoming,
-            "from_address": em.from_address,
-            "html_body": em.html_body,
-            "text_body": em.text_body,
-            "created_by_id": em.created_by_id,
-            "is_private_draft": em.is_private_draft,
-        })
-
-    tasks = session.query(SFTask).all()
-    tasks_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for t in tasks:
-        tasks_by_case[t.what_id].append({
-            "id": t.id,
-            "subject": t.subject,
-            "description": t.description,
-            "recording_urls_json": t.recording_urls_json or [],
-        })
-
-    s3_recs = session.query(SFS3Record).all()
-    s3_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for s3r in s3_recs:
-        s3_by_case[s3r.bp_case_id].append({
-            "id": s3r.id,
-            "bp_s3_url": s3r.bp_s3_url,
-            "bp_fallback_url": s3r.bp_fallback_url,
-        })
-
-    # Existing prepared/completed tickets in DB
-    existing_tickets = {t.case_id: t for t in session.query(MigrationTicket).all()}
-
     prep_report: List[Dict[str, Any]] = []
     custom_field_report: List[Dict[str, Any]] = []
     prepared_count = 0
@@ -226,120 +188,167 @@ def run_step3_prepare(
     standard_count = 0
     phone_count = 0
 
-    print("Building ticket payloads...", flush=True)
+    print("Building ticket payloads in memory-safe batches...", flush=True)
 
-    for index, c in enumerate(cases, start=1):
-        cid = c.id
-        source_type = "phone" if c.is_phone_case else "standard"
-        case_data = dict(c.raw_data_json or {})
-        case_data.update({
-            "id": c.id,
-            "case_number": c.case_number,
-            "account_id": c.account_id,
-            "contact_id": c.contact_id,
-            "owner_id": c.owner_id,
-            "created_date": c.created_date,
-            "subject": c.subject,
-            "description": c.description,
-            "status": c.status,
-            "priority": c.priority,
-            "origin": c.origin,
-            "type": c.type,
-            "record_type_id": c.record_type_id,
-        })
+    batch_size = 500
+    for batch_start in range(0, len(cases), batch_size):
+        batch_cases = cases[batch_start : batch_start + batch_size]
+        batch_case_ids = [c.id for c in batch_cases]
 
-        # Skip regenerating payload if ticket was already imported successfully
-        existing_t = existing_tickets.get(cid)
-        if existing_t and existing_t.status in {"completed", "existing", "completed_with_warnings"}:
-            prepared_count += 1
-            if source_type == "phone":
-                phone_count += 1
-            else:
-                standard_count += 1
-            continue
+        # Query related records ONLY for the current batch of cases to prevent OOM
+        batch_emails = session.query(SFEmailMessage).filter(SFEmailMessage.parent_id.in_(batch_case_ids)).all()
+        emails_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for em in batch_emails:
+            emails_by_case[em.parent_id].append(em.raw_data_json or {
+                "id": em.id,
+                "created_date": em.created_date,
+                "message_date": em.message_date,
+                "incoming": em.incoming,
+                "from_address": em.from_address,
+                "html_body": em.html_body,
+                "text_body": em.text_body,
+                "created_by_id": em.created_by_id,
+                "is_private_draft": em.is_private_draft,
+            })
+        del batch_emails
 
-        try:
-            payload, audit = build_ticket_payload(
-                case=case_data,
-                email_messages=emails_by_case.get(cid, []),
-                s3_records=s3_by_case.get(cid, []),
-                mapper=mapper,
-                contacts_by_id=contacts_by_id,
-                customer_users=customer_users,
-                customer_user_by_email=customer_user_by_email,
-                org_map=org_map,
-                owner_assignee_map=owner_assignee_map,
-                group_map=group_map,
-                brand_map=brand_map,
-                record_types_by_id=record_types_by_id,
-                akarsh_user_id=akarsh_user_id,
-                agent_user_by_sf_user_id=agent_user_by_sf_user_id,
-                agent_user_by_email=agent_user_by_email,
-                protected_agent_emails=protected_agent_emails,
-                prep_report=prep_report,
-                custom_field_report=custom_field_report,
-                phone_tasks=tasks_by_case.get(cid, []),
-                synthetic_domain=settings.synthetic_user_domain,
-            )
+        batch_tasks = session.query(SFTask).filter(SFTask.what_id.in_(batch_case_ids)).all()
+        tasks_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for t in batch_tasks:
+            tasks_by_case[t.what_id].append({
+                "id": t.id,
+                "subject": t.subject,
+                "description": t.description,
+                "recording_urls_json": t.recording_urls_json or [],
+            })
+        del batch_tasks
 
-            if not existing_t:
-                db_ticket = MigrationTicket(
-                    case_id=cid,
-                    case_number=c.case_number,
-                    ticket_type=source_type,
-                    status="prepared",
-                    prepared_payload_json=payload,
-                    audit_json=audit,
+        batch_s3 = session.query(SFS3Record).filter(SFS3Record.bp_case_id.in_(batch_case_ids)).all()
+        s3_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for s3r in batch_s3:
+            s3_by_case[s3r.bp_case_id].append({
+                "id": s3r.id,
+                "bp_s3_url": s3r.bp_s3_url,
+                "bp_fallback_url": s3r.bp_fallback_url,
+            })
+        del batch_s3
+
+        # Query existing tickets only for this batch
+        batch_existing_tickets = {
+            t.case_id: t
+            for t in session.query(MigrationTicket).filter(MigrationTicket.case_id.in_(batch_case_ids)).all()
+        }
+
+        for c in batch_cases:
+            cid = c.id
+            source_type = "phone" if c.is_phone_case else "standard"
+            case_data = dict(c.raw_data_json or {})
+            case_data.update({
+                "id": c.id,
+                "case_number": c.case_number,
+                "account_id": c.account_id,
+                "contact_id": c.contact_id,
+                "owner_id": c.owner_id,
+                "created_date": c.created_date,
+                "subject": c.subject,
+                "description": c.description,
+                "status": c.status,
+                "priority": c.priority,
+                "origin": c.origin,
+                "type": c.type,
+                "record_type_id": c.record_type_id,
+            })
+
+            # Skip regenerating payload if ticket was already imported successfully
+            existing_t = batch_existing_tickets.get(cid)
+            if existing_t and existing_t.status in {"completed", "existing", "completed_with_warnings"}:
+                prepared_count += 1
+                if source_type == "phone":
+                    phone_count += 1
+                else:
+                    standard_count += 1
+                continue
+
+            try:
+                payload, audit = build_ticket_payload(
+                    case=case_data,
+                    email_messages=emails_by_case.get(cid, []),
+                    s3_records=s3_by_case.get(cid, []),
+                    mapper=mapper,
+                    contacts_by_id=contacts_by_id,
+                    customer_users=customer_users,
+                    customer_user_by_email=customer_user_by_email,
+                    org_map=org_map,
+                    owner_assignee_map=owner_assignee_map,
+                    group_map=group_map,
+                    brand_map=brand_map,
+                    record_types_by_id=record_types_by_id,
+                    akarsh_user_id=akarsh_user_id,
+                    agent_user_by_sf_user_id=agent_user_by_sf_user_id,
+                    agent_user_by_email=agent_user_by_email,
+                    protected_agent_emails=protected_agent_emails,
+                    prep_report=prep_report,
+                    custom_field_report=custom_field_report,
+                    phone_tasks=tasks_by_case.get(cid, []),
+                    synthetic_domain=settings.synthetic_user_domain,
                 )
-                session.add(db_ticket)
-                existing_tickets[cid] = db_ticket
-            else:
-                existing_t.ticket_type = source_type
-                existing_t.status = "prepared"
-                existing_t.prepared_payload_json = payload
-                existing_t.audit_json = audit
 
-            prepared_count += 1
-            if source_type == "phone":
-                phone_count += 1
-            else:
-                standard_count += 1
+                if not existing_t:
+                    db_ticket = MigrationTicket(
+                        case_id=cid,
+                        case_number=c.case_number,
+                        ticket_type=source_type,
+                        status="prepared",
+                        prepared_payload_json=payload,
+                        audit_json=audit,
+                    )
+                    session.add(db_ticket)
+                    batch_existing_tickets[cid] = db_ticket
+                else:
+                    existing_t.ticket_type = source_type
+                    existing_t.status = "prepared"
+                    existing_t.prepared_payload_json = payload
+                    existing_t.audit_json = audit
 
-        except Exception as exc:
-            failed_count += 1
-            err_msg = str(exc)
-            if not existing_t:
-                db_ticket = MigrationTicket(
-                    case_id=cid,
-                    case_number=c.case_number,
-                    ticket_type=source_type,
-                    status="failed",
-                    error_type="PREPARATION_FAILED",
-                    failure_reason=err_msg[:1000],
-                    error_detail=err_msg,
+                prepared_count += 1
+                if source_type == "phone":
+                    phone_count += 1
+                else:
+                    standard_count += 1
+
+            except Exception as exc:
+                failed_count += 1
+                err_msg = str(exc)
+                if not existing_t:
+                    db_ticket = MigrationTicket(
+                        case_id=cid,
+                        case_number=c.case_number,
+                        ticket_type=source_type,
+                        status="failed",
+                        error_type="PREPARATION_FAILED",
+                        failure_reason=err_msg[:1000],
+                        error_detail=err_msg,
+                    )
+                    session.add(db_ticket)
+                    batch_existing_tickets[cid] = db_ticket
+                else:
+                    existing_t.status = "failed"
+                    existing_t.error_type = "PREPARATION_FAILED"
+                    existing_t.failure_reason = err_msg[:1000]
+                    existing_t.error_detail = err_msg
+
+                session.add(
+                    MigrationAuditLog(
+                        case_id=cid,
+                        stage="PREPARE",
+                        level="ERROR",
+                        status="FAILED",
+                        message=f"Payload preparation failed: {err_msg}",
+                    )
                 )
-                session.add(db_ticket)
-                existing_tickets[cid] = db_ticket
-            else:
-                existing_t.status = "failed"
-                existing_t.error_type = "PREPARATION_FAILED"
-                existing_t.failure_reason = err_msg[:1000]
-                existing_t.error_detail = err_msg
 
-            session.add(
-                MigrationAuditLog(
-                    case_id=cid,
-                    stage="PREPARE",
-                    level="ERROR",
-                    status="FAILED",
-                    message=f"Payload preparation failed: {err_msg}",
-                )
-            )
-
-        if index % 200 == 0 or index == len(cases):
-            session.commit()
-            print(f"  [Prepare] processed {index:,}/{len(cases):,} Cases; prepared {prepared_count:,}, failed {failed_count:,}...", flush=True)
-
+        session.commit()
+        print(f"  [Prepare] Processed {min(batch_start + batch_size, len(cases)):,}/{len(cases):,} Cases; prepared {prepared_count:,}, failed {failed_count:,}...", flush=True)
     session.commit()
     print("=" * 68)
     print("STEP 3 COMPLETE: TICKET PAYLOADS PREPARED IN DATABASE")

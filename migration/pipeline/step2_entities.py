@@ -21,9 +21,13 @@ from migration.engine.field_mapper import normalize_label, s
 from migration.engine.identity_resolver import IdentityResolver, norm, sha12, valid_email
 
 
+from datetime import datetime, timedelta
+
 def run_step2_entities(
     settings: MigrationSettings,
     session: Session,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     ticket_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute Step 2: Sync Zendesk Organizations and End Users into database tables."""
@@ -31,6 +35,8 @@ def run_step2_entities(
     print("STEP 2: MIGRATE ORGANIZATIONS & END USERS (BULK OPTIMIZED & DB STORED)")
     if ticket_ids:
         print(f"Ticket IDs Scope: {len(ticket_ids)} specified ticket(s)")
+    if start_date or end_date:
+        print(f"Date Scope: {start_date or 'beginning'} -> {end_date or 'latest'}")
     print("=" * 68)
 
     zd = ZendeskClient(
@@ -48,10 +54,10 @@ def run_step2_entities(
     # -------------------------------------------------------------------------
     if ticket_ids:
         from sqlalchemy import or_
-        scoped_cases = session.query(SFCase).filter(
+        scoped_case_accs = session.query(SFCase.account_id).filter(
             or_(SFCase.id.in_(ticket_ids), SFCase.case_number.in_(ticket_ids))
-        ).all()
-        rel_account_ids = {c.account_id for c in scoped_cases if c.account_id}
+        ).distinct().all()
+        rel_account_ids = {r[0] for r in scoped_case_accs if r[0]}
         accounts = session.query(SFAccount).filter(SFAccount.id.in_(rel_account_ids)).all() if rel_account_ids else []
     else:
         accounts = session.query(SFAccount).all()
@@ -151,44 +157,97 @@ def run_step2_entities(
     print(f"Organizations sync complete. Total mapped organizations in DB: {len(org_map):,}.", flush=True)
 
     # -------------------------------------------------------------------------
-    # 2. End Users Discovery & Sync
+    # 2. End Users Discovery & Sync (Memory-Optimized Projections)
     # -------------------------------------------------------------------------
-    if ticket_ids:
-        from sqlalchemy import or_
-        cases = session.query(SFCase).filter(
-            or_(SFCase.id.in_(ticket_ids), SFCase.case_number.in_(ticket_ids))
-        ).all()
-        case_con_ids = {c.contact_id for c in cases if c.contact_id}
-        contacts = session.query(SFContact).filter(SFContact.id.in_(case_con_ids)).all() if case_con_ids else []
-        case_ids_set = {c.id for c in cases}
-        emails = session.query(SFEmailMessage).filter(SFEmailMessage.parent_id.in_(case_ids_set)).all() if case_ids_set else []
-    else:
-        cases = session.query(SFCase).all()
-        contacts = session.query(SFContact).all()
-        emails = session.query(SFEmailMessage).all()
-    sf_users = session.query(SFUser).all()
+    # Project ONLY the lightweight columns required for discovery.
+    # CRITICAL: Exclude raw_data_json, custom_fields_json, and description.
+    from sqlalchemy import literal_column, or_
 
-    contacts_by_id = {c.id: {"id": c.id, "name": c.name, "email": c.email, "phone": c.phone, "mobile_phone": c.mobile_phone} for c in contacts}
+    case_query = session.query(
+        SFCase.id,
+        SFCase.case_number,
+        SFCase.contact_id,
+        SFCase.account_id,
+        literal_column("raw_data_json->>'ContactEmail'").label("contact_email"),
+        literal_column("raw_data_json->>'SuppliedEmail'").label("supplied_email"),
+        literal_column("raw_data_json->>'SuppliedName'").label("supplied_name"),
+        literal_column("raw_data_json->>'SuppliedPhone'").label("supplied_phone"),
+    )
+    if ticket_ids:
+        case_query = case_query.filter(
+            or_(SFCase.id.in_(ticket_ids), SFCase.case_number.in_(ticket_ids))
+        )
+    if start_date:
+        case_query = case_query.filter(SFCase.created_date >= f"{start_date}T00:00:00Z")
+    if end_date:
+        parsed_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        next_day = parsed_end + timedelta(days=1)
+        case_query = case_query.filter(SFCase.created_date < f"{next_day.isoformat()}T00:00:00Z")
+
+    print("Querying candidate Cases from database for identity discovery...", flush=True)
+    case_rows = case_query.all()
+    print(f"Loaded {len(case_rows):,} candidate Case headers.", flush=True)
+
+    case_ids_set = {r.id for r in case_rows}
+    contact_ids_set = {r.contact_id for r in case_rows if r.contact_id}
+
+    if contact_ids_set:
+        contacts = session.query(
+            SFContact.id,
+            SFContact.name,
+            SFContact.email,
+            SFContact.phone,
+            SFContact.mobile_phone,
+        ).filter(SFContact.id.in_(contact_ids_set)).all()
+        contacts_by_id = {
+            c.id: {
+                "id": c.id,
+                "name": c.name,
+                "email": c.email,
+                "phone": c.phone,
+                "mobile_phone": c.mobile_phone,
+            }
+            for c in contacts
+        }
+    else:
+        contacts_by_id = {}
+
+    # MEMORY OPTIMIZATION:
+    # Query ONLY incoming emails and ONLY the 3 needed columns (parent_id, from_address, from_name).
+    # Completely avoids loading multi-gigabyte html_body, text_body, and raw_data_json into RAM.
+    print("Querying incoming email message senders from database...", flush=True)
     emails_by_case: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for em in emails:
-        emails_by_case[em.parent_id].append({
-            "id": em.id,
-            "incoming": em.incoming,
-            "from_address": em.from_address,
-            "from_name": em.from_name,
-        })
+    email_rows = session.query(
+        SFEmailMessage.parent_id,
+        SFEmailMessage.from_address,
+        SFEmailMessage.from_name,
+    ).filter(SFEmailMessage.incoming == True).all()
+
+    for em_parent_id, em_from_addr, em_from_name in email_rows:
+        if em_parent_id in case_ids_set:
+            emails_by_case[em_parent_id].append({
+                "incoming": True,
+                "from_address": em_from_addr,
+                "from_name": em_from_name,
+            })
+    del email_rows
 
     cases_list = [
         {
-            "id": c.id,
-            "case_number": c.case_number,
-            "contact_id": c.contact_id,
-            "account_id": c.account_id,
-            "raw_data": c.raw_data_json or {},
+            "id": r.id,
+            "case_number": r.case_number,
+            "contact_id": r.contact_id,
+            "account_id": r.account_id,
+            "contact_email": r.contact_email,
+            "supplied_email": r.supplied_email,
+            "supplied_name": r.supplied_name,
+            "supplied_phone": r.supplied_phone,
         }
-        for c in cases
+        for r in case_rows
     ]
+    del case_rows
 
+    sf_users = session.query(SFUser.id, SFUser.email).all()
     protected_agent_emails = {norm(u.email) for u in sf_users if valid_email(u.email)}
     protected_agent_emails.add(norm(settings.agent_comment_email))
 
@@ -196,19 +255,28 @@ def run_step2_entities(
     identities = resolver.discover_identities(
         cases_list, contacts_by_id, emails_by_case, protected_agent_emails
     )
+    del cases_list
+    del emails_by_case
+    del contacts_by_id
     print(f"Identities discovered: {len(identities):,} unique customer identities.", flush=True)
 
-    # Check existing users in DB table
-    existing_db_users = {
-        u.identity_key: u
-        for u in session.query(ZendeskUser).filter(ZendeskUser.status.in_(["completed", "existing"])).all()
-    }
-    user_state: Dict[str, int] = {k: u.zendesk_user_id for k, u in existing_db_users.items() if u.zendesk_user_id}
-    email_map: Dict[str, int] = {norm(u.source_email): u.zendesk_user_id for u in existing_db_users.values() if u.source_email and u.zendesk_user_id}
+    # Check existing users in DB table (only lightweight projected fields)
+    existing_user_rows = session.query(
+        ZendeskUser.identity_key,
+        ZendeskUser.source_email,
+        ZendeskUser.zendesk_user_id,
+    ).filter(
+        ZendeskUser.status.in_(["completed", "existing"]),
+        ZendeskUser.zendesk_user_id.isnot(None),
+    ).all()
+    user_state: Dict[str, int] = {r.identity_key: r.zendesk_user_id for r in existing_user_rows if r.identity_key}
+    email_map: Dict[str, int] = {norm(r.source_email): r.zendesk_user_id for r in existing_user_rows if r.source_email}
+    all_db_identity_keys: Set[str] = {r[0] for r in session.query(ZendeskUser.identity_key).all()}
 
     missing_unique_emails: Dict[str, Dict[str, Any]] = {}
     identity_keys_by_email: Dict[str, List[str]] = defaultdict(list)
 
+    new_user_records_count = 0
     for identity_key, identity in sorted(identities.items()):
         if identity_key in user_state:
             continue
@@ -224,8 +292,7 @@ def run_step2_entities(
         if clean_email_key in email_map and not identity.get("is_synthetic"):
             uid = email_map[clean_email_key]
             user_state[identity_key] = uid
-            db_u = session.query(ZendeskUser).filter_by(identity_key=identity_key).first()
-            if not db_u:
+            if identity_key not in all_db_identity_keys:
                 session.add(
                     ZendeskUser(
                         identity_key=identity_key,
@@ -241,6 +308,10 @@ def run_step2_entities(
                         status="existing",
                     )
                 )
+                all_db_identity_keys.add(identity_key)
+                new_user_records_count += 1
+                if new_user_records_count % 1000 == 0:
+                    session.commit()
             continue
 
         # Queue for verification/creation
@@ -260,6 +331,9 @@ def run_step2_entities(
             },
         )
 
+    if new_user_records_count > 0:
+        session.commit()
+
     print(
         f"End Users: {len(user_state):,} already resolved in DB; "
         f"{len(missing_unique_emails):,} unique emails to check/create in Zendesk.",
@@ -277,97 +351,103 @@ def run_step2_entities(
             pending_payloads.append(payload)
             pending_meta.append({"email_key": email_key, **item})
 
-        # Try bulk creation
-        zd.bulk_create("/api/v2/users/create_many", "users", pending_payloads, "End User bulk create")
+        # Process in batches of 200 (2 bulk creation jobs at a time) to keep memory flat
+        batch_size = 200
+        for chunk_start in range(0, len(pending_payloads), batch_size):
+            chunk_payloads = pending_payloads[chunk_start : chunk_start + batch_size]
+            chunk_meta = pending_meta[chunk_start : chunk_start + batch_size]
 
-        # Verify created users by external ID
-        refreshed_users = zd.show_many_by_external_ids(
-            "/api/v2/users/show_many", "users", [u["external_id"] for u in pending_payloads if u.get("external_id")]
-        )
+            # Try bulk creation
+            zd.bulk_create("/api/v2/users/create_many", "users", chunk_payloads, "End User bulk create")
 
-        for meta, payload in zip(pending_meta, pending_payloads):
-            ext_id = payload.get("external_id")
-            user = refreshed_users.get(ext_id.casefold()) if ext_id else None
+            # Verify created users by external ID
+            refreshed_users = zd.show_many_by_external_ids(
+                "/api/v2/users/show_many", "users", [u["external_id"] for u in chunk_payloads if u.get("external_id")]
+            )
 
-            if not user:
-                # Fallback to single user creation
-                try:
-                    org_id = payload.get("organization_id")
-                    source_phone = payload.get("phone")
+            for meta, payload in zip(chunk_meta, chunk_payloads):
+                ext_id = payload.get("external_id")
+                user = refreshed_users.get(ext_id.casefold()) if ext_id else None
+
+                if not user:
+                    # Fallback to single user creation
                     try:
-                        user = zd.create_end_user(
-                            payload.get("name"), payload.get("email"), ext_id,
-                            int(org_id) if org_id else None, phone=source_phone
-                        )
-                    except Exception as create_err:
-                        err_str = str(create_err)
-                        if "422" in err_str and "phone" in err_str.lower():
+                        org_id = payload.get("organization_id")
+                        source_phone = payload.get("phone")
+                        try:
                             user = zd.create_end_user(
                                 payload.get("name"), payload.get("email"), ext_id,
-                                int(org_id) if org_id else None, phone=None
+                                int(org_id) if org_id else None, phone=source_phone
                             )
-                        else:
-                            user = zd.find_user_by_external_id(ext_id)
-                            if not user and not meta.get("_is_synthetic"):
-                                user = zd.find_user_by_email(payload.get("email"))
-                            if not user:
-                                raise create_err
-                except Exception as exc:
-                    email_key = meta["email_key"]
-                    for ikey in identity_keys_by_email.get(email_key, []):
-                        ident = identities[ikey]
-                        db_u = session.query(ZendeskUser).filter_by(identity_key=ikey).first()
-                        if not db_u:
-                            session.add(
-                                ZendeskUser(
-                                    identity_key=ikey,
-                                    salesforce_contact_id=ident.get("salesforce_contact_id"),
-                                    source_email=ident.get("source_email"),
-                                    salesforce_account_id=ident.get("account_id"),
-                                    external_id=ext_id,
-                                    is_synthetic=bool(ident.get("is_synthetic")),
-                                    status="failed",
-                                    error_message=str(exc),
+                        except Exception as create_err:
+                            err_str = str(create_err)
+                            if "422" in err_str and "phone" in err_str.lower():
+                                user = zd.create_end_user(
+                                    payload.get("name"), payload.get("email"), ext_id,
+                                    int(org_id) if org_id else None, phone=None
                                 )
-                            )
-                        else:
-                            db_u.status = "failed"
-                            db_u.error_message = str(exc)
+                            else:
+                                user = zd.find_user_by_external_id(ext_id)
+                                if not user and not meta.get("_is_synthetic"):
+                                    user = zd.find_user_by_email(payload.get("email"))
+                                if not user:
+                                    raise create_err
+                    except Exception as exc:
+                        email_key = meta["email_key"]
+                        for ikey in identity_keys_by_email.get(email_key, []):
+                            ident = identities[ikey]
+                            db_u = session.query(ZendeskUser).filter_by(identity_key=ikey).first()
+                            if not db_u:
+                                session.add(
+                                    ZendeskUser(
+                                        identity_key=ikey,
+                                        salesforce_contact_id=ident.get("salesforce_contact_id"),
+                                        source_email=ident.get("source_email"),
+                                        salesforce_account_id=ident.get("account_id"),
+                                        external_id=ext_id,
+                                        is_synthetic=bool(ident.get("is_synthetic")),
+                                        status="failed",
+                                        error_message=str(exc),
+                                    )
+                                )
+                            else:
+                                db_u.status = "failed"
+                                db_u.error_message = str(exc)
+                        continue
+
+                if not user or not user.get("id"):
                     continue
 
-            if not user or not user.get("id"):
-                continue
+                uid = int(user["id"])
+                source_email = payload.get("email")
+                email_map[norm(source_email)] = uid
 
-            uid = int(user["id"])
-            source_email = payload.get("email")
-            email_map[norm(source_email)] = uid
-
-            for ikey in identity_keys_by_email.get(meta["email_key"], []):
-                ident = identities[ikey]
-                user_state[ikey] = uid
-                db_u = session.query(ZendeskUser).filter_by(identity_key=ikey).first()
-                if not db_u:
-                    session.add(
-                        ZendeskUser(
-                            identity_key=ikey,
-                            salesforce_contact_id=ident.get("salesforce_contact_id"),
-                            source_email=ident.get("source_email"),
-                            zendesk_email=user.get("email") or source_email,
-                            phone=ident.get("phone"),
-                            salesforce_account_id=ident.get("account_id"),
-                            zendesk_org_id=org_map.get(ident.get("account_id")),
-                            external_id=ext_id,
-                            zendesk_user_id=uid,
-                            is_synthetic=bool(ident.get("is_synthetic")),
-                            status="completed",
+                for ikey in identity_keys_by_email.get(meta["email_key"], []):
+                    ident = identities[ikey]
+                    user_state[ikey] = uid
+                    db_u = session.query(ZendeskUser).filter_by(identity_key=ikey).first()
+                    if not db_u:
+                        session.add(
+                            ZendeskUser(
+                                identity_key=ikey,
+                                salesforce_contact_id=ident.get("salesforce_contact_id"),
+                                source_email=ident.get("source_email"),
+                                zendesk_email=user.get("email") or source_email,
+                                phone=ident.get("phone"),
+                                salesforce_account_id=ident.get("account_id"),
+                                zendesk_org_id=org_map.get(ident.get("account_id")),
+                                external_id=ext_id,
+                                zendesk_user_id=uid,
+                                is_synthetic=bool(ident.get("is_synthetic")),
+                                status="completed",
+                            )
                         )
-                    )
-                else:
-                    db_u.zendesk_user_id = uid
-                    db_u.zendesk_email = user.get("email") or source_email
-                    db_u.status = "completed"
+                    else:
+                        db_u.zendesk_user_id = uid
+                        db_u.zendesk_email = user.get("email") or source_email
+                        db_u.status = "completed"
 
-        session.commit()
+            session.commit()
 
     total_users_success = session.query(ZendeskUser).filter(ZendeskUser.status.in_(["completed", "existing"])).count()
     total_users_failed = session.query(ZendeskUser).filter_by(status="failed").count()

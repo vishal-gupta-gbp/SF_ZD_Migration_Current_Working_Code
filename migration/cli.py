@@ -162,7 +162,13 @@ def main(args: Optional[list] = None) -> int:
 
     elif parsed.command == "entities":
         with get_db() as session:
-            run_step2_entities(settings=settings, session=session, ticket_ids=ticket_ids)
+            run_step2_entities(
+                settings=settings,
+                session=session,
+                start_date=getattr(parsed, "start_date", None),
+                end_date=getattr(parsed, "end_date", None),
+                ticket_ids=ticket_ids,
+            )
         return 0
 
     elif parsed.command == "prepare":

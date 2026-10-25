@@ -83,7 +83,13 @@ def run_full_migration(
 
         # STEP 2: Entities
         with get_db() as session:
-            s2 = run_step2_entities(settings=settings, session=session, ticket_ids=ticket_ids)
+            s2 = run_step2_entities(
+                settings=settings,
+                session=session,
+                start_date=start_date,
+                end_date=end_date,
+                ticket_ids=ticket_ids,
+            )
             summary["step2_entities"] = s2
 
         # STEP 3: Prepare
